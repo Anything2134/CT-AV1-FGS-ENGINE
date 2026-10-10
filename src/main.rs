@@ -25,7 +25,7 @@ enum MutagenState {
 
 #[derive(Parser, Debug)]
 #[command(name = "CT-AV1-FGS-ENGINE")]
-#[command(version = "1.1.1")]
+#[command(version = "1.2.0")]
 #[command(about = "High-performance AV1 Film Grain Synthesis Engine (Celluloid 70mm & Digital Hybrid) in Rust")]
 struct Args {
     #[arg(short, long, help = "Path to .vpy script or video container (.mkv, .mp4, .y4m)")]
@@ -63,6 +63,9 @@ struct Args {
 
     #[arg(long, value_enum, default_value = "on", help = "Advanced Mutagen entropy/grain analysis module (on/off)")]
     mutagen: MutagenState,
+
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=2), help = "Bypass content-type bias & lock intensity on tuned grain (1: Lock both [default], 2: Lock force-type only, allow intensity, 0: Disabled)")]
+    force_bypass: u8,
 }
 
 const BIN_CENTERS: [u8; 8] = [16, 48, 80, 112, 144, 176, 208, 240];
@@ -115,7 +118,7 @@ impl Y4mStream {
                 .arg("-map")
                 .arg("0:v:0")
                 .arg("-strict")
-                .arg("-1") // Permite formatos Y4M de alta profundidad (10/12/16-bit)
+                .arg("-1")
                 .arg("-f")
                 .arg("yuv4mpegpipe")
                 .arg("-")
@@ -771,7 +774,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    println!("[*] Initializing CT-AV1-FGS-ENGINE (Rust Engine v1.1.1)...");
+    println!("[*] Initializing CT-AV1-FGS-ENGINE (Rust Engine v1.2.0)...");
     let mut stream = Y4mStream::from_input(&args.input)?;
     println!(
         "    - Stream: {}x{} | {}-bit depth ({} bytes/sample)",
@@ -795,6 +798,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let auto = classify_frame_auto(&first_frame, stream.width, stream.height);
         println!("[*] Content type auto-detected: {:?}", auto);
         auto
+    };
+
+    let is_tuning_active = args.tune_grain || digital_noise_mode.is_some();
+
+    // Gestión del parámetro --force-bypass
+    let (analysis_ctype, effective_tune_intensity) = if is_tuning_active && args.force_bypass >= 1 {
+        let eff_int = if args.force_bypass == 1 {
+            println!("    [*] --force-bypass 1 active: Bypassing content-type skew and locking --intensity to 1.0 for authentic reproduction.");
+            1.0f32
+        } else {
+            println!("    [*] --force-bypass 2 active: Bypassing content-type skew; user --intensity {:.2} will be applied.", args.intensity);
+            args.intensity
+        };
+        (ContentType::LiveAction, eff_int)
+    } else {
+        (content_type, args.intensity)
     };
 
     let lookahead_window = args.lookahead.unwrap_or(0);
@@ -837,7 +856,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             if let Some(frame) = stream.read_next_luma_normalized() {
                 let (current_prof, _) = if args.mutagen == MutagenState::On {
-                    mutagen_engine.analyze_frame(&frame, stream.width, stream.height, content_type)
+                    mutagen_engine.analyze_frame(&frame, stream.width, stream.height, analysis_ctype)
                 } else {
                     fallback_analyze_frame(&frame, stream.width, stream.height)
                 };
@@ -861,7 +880,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if args.fg_search_full {
                     if smoothed_profile.avg_sigma >= 1.15 || digital_noise_mode.is_some() {
-                        write_fgs_entry(&mut out_file, seg.start_frame, seg.end_frame, smoothed_profile.lag, &smoothed_profile.profile_sy, args.intensity)?;
+                        write_fgs_entry(&mut out_file, seg.start_frame, seg.end_frame, smoothed_profile.lag, &smoothed_profile.profile_sy, effective_tune_intensity)?;
                     } else {
                         let (lag, subtle_sy) = get_subtle_70mm_profile(content_type, smoothed_profile.mean_luma);
                         write_fgs_entry(&mut out_file, seg.start_frame, seg.end_frame, lag, &subtle_sy, args.intensity)?;
@@ -889,14 +908,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("[*] Generating static global grain table...");
         let (prof, _) = if args.mutagen == MutagenState::On {
-            mutagen_engine.analyze_frame(&first_frame, stream.width, stream.height, content_type)
+            mutagen_engine.analyze_frame(&first_frame, stream.width, stream.height, analysis_ctype)
         } else {
             fallback_analyze_frame(&first_frame, stream.width, stream.height)
         };
 
         if (args.tune_grain && prof.avg_sigma >= 1.15) || digital_noise_mode.is_some() {
             println!("    [+] Noise/grain detected (Sigma: {:.2}). Synthesizing...", prof.avg_sigma);
-            write_fgs_entry(&mut out_file, 0, 18446744073709551615, prof.lag, &prof.profile_sy, args.intensity)?;
+            write_fgs_entry(&mut out_file, 0, 18446744073709551615, prof.lag, &prof.profile_sy, effective_tune_intensity)?;
         } else {
             println!("    [*] Applying subtle 70mm baseline default profile...");
             let (lag, subtle_sy) = get_subtle_70mm_profile(content_type, prof.mean_luma);

@@ -1,6 +1,6 @@
 [package]
 name = "ct-av1-fgs-engine"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 authors = ["Anything2134"]
 description = "CT-AV1-FGS-ENGINE: Advanced Hybrid Celluloid & Digital Noise AV1 Film Grain Synthesis Engine"
