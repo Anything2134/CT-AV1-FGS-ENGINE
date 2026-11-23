@@ -1,10 +1,10 @@
 [package]
 name = "ct-av1-fgs-engine"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 authors = ["Anything2134"]
-description = "CT-AV1-FGS-ENGINE: Advanced Hybrid Celluloid & Digital Noise AV1 Film Grain Synthesis Engine"
-license = "GPL-3.0"
+description = "CT-AV1-FGS-ENGINE: Hybrid Celluloid, ISO Photon-Noise & VapourSynth Auto-Degrain FGS Engine"
+license = "Apache-2.0"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

@@ -1,48 +1,34 @@
 # CT-AV1-FGS-ENGINE
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Rust](https://img.shields.io/badge/Rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
-[![Version](https://img.shields.io/badge/version-1.2.0-green.svg)](https://github.com/Anything2134/av1-fgs-engine)
+[![Version](https://img.shields.io/badge/version-1.3.0-green.svg)](https://github.com/Anything2134/av1-fgs-engine)
 
-An advanced, high-performance Film Grain Synthesis (FGS) table generator written in Rust for **SVT-AV1**, **aomenc**, and **Av1an**. Emulates fine **70mm celluloid film grain** and provides an intelligent hybrid digital noise synthesis model.
+An advanced, high-performance AV1 Film Grain Synthesis (FGS) table generator and VapourSynth auto-denoise/auto-degrain companion engine written in Rust for **SVT-AV1**, **aomenc**, and **Av1an**.
 
 ---
 
-## What's New in v1.2.0
+## What's New in v1.3.0
 
-- **`--force-bypass` Parameter**:
-  - `1` (Default): Prevents `--force-type` from skewing/damping grain detection and locks `--intensity` to `1.0` for authentic, uncompromised source grain replication.
-  - `2`: Bypasses `--force-type` skew during analysis, but allows manual scaling with `--intensity`.
-  - `0`: Disabled (legacy behavior).
-- **Deep Bit Depth Support (8-bit up to 16-bit)**: Native parsing of uncompressed 10-bit, 12-bit, and 16-bit Y4M streams (`yuv420p10le`, `yuv420p12le`, `yuv420p16le`) with `-strict -1` pipeline integration.
-- **HDR & Wide Color Gamut**: Full compatibility with BT.2020, HDR10 (PQ / ST 2084), HLG, and Dolby Vision without highlight luminance skewing.
-- **Mutagen Module**: Advanced spatial entropy estimation combining patch-based **Non-Local Means (NLM)** and **Median Absolute Deviation (MAD)** for robust noise separation.
-- **Digital Noise & 70mm Hybrid Synthesis**: Capture digital sensor/photon noise or blend it seamlessly with celluloid grain (`--tune-grain-noise-digital` & `--no-noise-bias`).
-- **Monotonic Scene Deduplication**: Chronological parsing supporting both Av1an JSON and CSV scene files.
+- **Refined Mutagen Algorithms**:
+  - **Isotropic 3×3 Scharr Edge Detector**: Superior rotational accuracy to protect diagonal 2D line art.
+  - **2D Planar Linear-Trend Subtraction**: Prevents smooth gradients (skies, skin shading) from triggering false grain readings.
+  - **Immerkaer 3×3 Laplacian MAD + Wang/Muijs 8×8 DCT Blockiness Index**: Separates unwanted compression/sensor noise from authentic film grain.
+  - **Patch-Similarity NLM Consensus**: Down-weights isolated deterministic micro-textures.
+- **ISO-Based Photon Noise Mode (`--iso` & `--photon-noise`)**: Physical Poisson shot-noise curves calibrated across **BT.1886 (SDR)**, **ST 2084 (HDR PQ)**, and **HLG**.
+- **VapourSynth Auto-Denoise & Auto-Degrain Plugin (`--emit-vs-plugin` & `--export-vs-profile`)**: Automatically strips compression/mosquito noise while preserving a user-defined percentage of film grain (`--grain-retain`) with closed-loop FGS variance compensation (`--fgs-balance`).
 
 ---
 
 ## Installation & Compilation
 
-Ensure you have Rust (`cargo`), `ffmpeg`, and optionally `vapoursynth` (`vspipe`) installed.
-
 ```bash
-# Clone the repository
-git clone https://github.com/Anything2134/av1-fgs-engine.git
-cd av1-fgs-engine
-
-# Compile the optimized binary
 cargo build --release
-
-# Install globally to your system PATH
 cargo install --path .
-```
 
-### Command-Line Interface (CLI)
+Command-Line Interface (CLI)
 
-```
 Usage: ct-av1-fgs-engine [OPTIONS] --input <INPUT>
-
 
 Options:
   -i, --input <INPUT>                         Path to .vpy script or video container (.mkv, .mp4, .y4m)
@@ -56,71 +42,77 @@ Options:
       --intensity <FLOAT>                     Global grain intensity multiplier [default: 1.0]
       --no-noise-bias <0|1>                   Noise bias filter: 1 = pure grain; 0 = allow digital noise [default: 1]
       --tune-grain-noise-digital <1|2>        Digital tuning (1: Transparent digital, 2: Balanced 70mm hybrid)
-      --mutagen <on|off>                      Advanced Mutagen NLM/MAD analysis module [default: on]
+      --mutagen <on|off>                      Advanced Mutagen spectral/NLM/MAD analysis module [default: on]
       --force-bypass <0|1|2>                  Bypass content bias & lock intensity on tuned grain [default: 1]
+      --iso <50..25600>                       ISO-based photon noise scaling mode (e.g., 200, 800, 1600)
+      --photon-noise <1..64>                  Av1an-compatible photon noise level (maps to ISO = value * 100)
+      --transfer <auto|sdr|pq|hlg>            Transfer curve for ISO photon noise calculation [default: auto]
+      --grain-retain <0..100>                 Percentage of film grain retained after VapourSynth auto-degrain [default: 0]
+      --fgs-balance <complement|linear|full>  FGS compensation mode for retained grain [default: complement]
+      --export-vs-profile <PATH>              Export per-scene telemetry JSON for VapourSynth plugin
+      --emit-vs-plugin <PATH>                 Generate the VapourSynth Python plugin module (e.g., ct_fgs_vs.py)
   -h, --help                                  Print help
   -V, --version                               Print version
 
-```
+VapourSynth Auto-Denoise & Auto-Degrain Workflow
 
-#Parameter Reference
+Step 1: Emit the VapourSynth Plugin & Analyze Source
 
-Input, Output & Content Classification
+Generate ct_fgs_vs.py, export per-scene telemetry (vs_profile.json), and build a
+50% complementary FGS table:
 
-  - -i, --input <PATH>: Video file or VapourSynth script. Automatically spawns
-    vspipe -c y4m for .vpy or ffmpeg -strict -1 -f yuv4mpegpipe for video
-    containers.
-  - -o, --output <PATH>: Destination path for the generated filmgrn1 table
-    (defaults to 70mm_grain.tbl).
-  - --force-type <2d | 3d | live_action>: Overrides spatial heuristic detection.
-      - 2d: Suppresses dark noise to protect line art and prevents buzzing in
-        flat color fields.
-      - 3d: Optimizes midtone dithering to break 8/10-bit banding gradients in
-        CGI.
-      - live_action: Full sensitometric curve matching large-format
-        photochemical stocks.
-  - --force-bypass <0 | 1 | 2>: Controls whether content-type bias and intensity
-    are bypassed during tuned grain analysis (default: 1).
-      - 1: Bypasses --force-type attenuation and locks --intensity to 1.0 for
-        faithful, objective source grain reproduction.
-      - 2: Bypasses --force-type attenuation, but allows scaling the output
-        using --intensity.
-      - 0: Disabled (legacy behavior).
+ct-av1-fgs-engine \
+    -i "input.mkv" \
+    -o "grain_50_comp.tbl" \
+    --emit-vs-plugin ct_fgs_vs.py \
+    --export-vs-profile vs_profile.json \
+    --tune-grain \
+    --fg-search-full \
+    --scenes escenas.csv \
+    --grain-retain 50 \
+    --fgs-balance complement
 
-Grain Profiling, Digital Noise & Mutagen
+  - --grain-retain 50 instructs VapourSynth to strip 100% of
+    compression/mosquito noise while retaining 50% of authentic film grain in
+    the encoded pixels.
+  - --fgs-balance complement automatically scales the FGS table to
+    \sqrt{1 - 0.5^2} \approx 86.6\% amplitude so the encoded grain and
+    synthesized FGS sum up to 100% of original grain variance. (Use
+    --fgs-balance full to synthesize 100% of detected grain regardless of
+    retention).
 
-  - --tune-grain: Activates deep block-based Fourier variance analysis.
-    Replicates source grain (1:1) if detected; falls back to the
-    imperceptible 70mm baseline if clean.
-  - --no-noise-bias <0 | 1>: Controls the compression/sensor artifact filter
-    (default 1).
-      - 1: Filters out compression noise (DCT block boundaries) and sensor noise
-        to isolate authentic celluloid grain.
-      - 0: Disables the filter to allow synthesis of digital noise.
-  - --tune-grain-noise-digital <1 | 2>: Only active when --no-noise-bias 0
-    (defaults to 2).
-      - 1: Transparent pass-through of original digital sensor/photon noise.
-      - 2: Balanced hybrid. Blends digital noise amplitude with an organic 70mm
-        celluloid curve to restore texture after VapourSynth degraining without
-        introducing mosquito artifacts.
-  - --mutagen <on | off>: Toggles the Non-Local Means (NLM) and Median Absolute
-    Deviation (MAD) decomposition engine (default on).
-  - --fg-search-full: Scans the entire video scene by scene. Requires
-    --tune-grain.
-  - --forced-fg-search-full: Scene-by-scene adaptive 70mm grain search for
-    clean/grainless content. Modulates the subtle curve according to each
-    scene's mean luminance without creating a static texture.
-  - --lookahead <FRAMES>: Moving average buffer on noise variance (\sigma) and
-    luminance across adjacent scenes to eliminate cut-to-cut grain flicker.
-  - --scenes <PATH>: Ingests Av1an scene cut files (auto-detects JSON or CSV
-    format and eliminates duplicate segments).
-  - --intensity <FLOAT>: Global multiplier on synthesis amplitude (default:
-    1.0).
+Step 2: Use inside your .vpy script
 
-### License
+import vapoursynth as vs
+from vapoursynth import core
+import ct_fgs_vs as ctfgs
 
-This project is licensed under the GNU General Public License v3.0 (GPL-3.0).
-See the LICENSE file for details.
+clip = core.bs.VideoSource(source="input.mkv")
 
-#### POWERED BY GEMINI.
-Gemini 3.8 Flash
+# Automatically removes compression/mosquito noise per scene and keeps 50% of real grain
+clip = ctfgs.auto_degrain(
+    clip,
+    profile="vs_profile.json",
+    grain_retain=50,
+    protect_lines=True,
+)
+
+clip.set_output()
+
+Step 3: Encode with Av1an / SVT-AV1
+
+av1an -i zero.vpy -e svt-av1 -s escenas.csv -v " --crf 24 --fgs-table grain_50_comp.tbl " -o output.mkv
+
+ISO Photon-Noise Mode Examples
+
+# Equivalent to Av1an --photon-noise 8 (ISO 800) with smooth 70mm spatial correlation
+ct-av1-fgs-engine -i input.mkv -o iso800.tbl --iso 800
+
+# HDR10 PQ photon noise (ISO 400)
+ct-av1-fgs-engine -i movie_hdr.mkv -o hdr_iso400.tbl --photon-noise 4 --transfer pq
+
+License
+
+This project is licensed under the Apache License, Version 2.0. See the LICENSE
+file for details.
+
