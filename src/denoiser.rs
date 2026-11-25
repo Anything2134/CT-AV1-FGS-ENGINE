@@ -3,7 +3,6 @@ use crate::types::{ChromaSubsampling, GrainProfile, MotionField, YuvFrame};
 use rayon::prelude::*;
 
 /// Non-destructive 3x3 impulse/mosquito spike clamp (clean-room RemoveGrain mode 1 equivalent).
-/// Restricts center pixel strictly within the [min, max] envelope of its 8 spatial neighbors.
 pub fn spatial_impulse_clamp(plane: &[f32], width: usize, height: usize) -> Vec<f32> {
     let mut out = plane.to_vec();
     if width < 3 || height < 3 {
@@ -38,12 +37,20 @@ pub fn spatial_impulse_clamp(plane: &[f32], width: usize, height: usize) -> Vec<
     out
 }
 
-/// Computes per-pixel Scharr edge strength [0.0..1.0] for crisp 2D line art preservation.
-fn compute_edge_protection_mask(plane: &[f32], width: usize, height: usize) -> Vec<f32> {
+/// Computes per-pixel Scharr edge & local texture protection mask [0.0..1.0].
+fn compute_detail_protection_mask(
+    plane: &[f32],
+    width: usize,
+    height: usize,
+    detail_protect: f32,
+) -> Vec<f32> {
     let mut mask = vec![0.0f32; width * height];
-    if width < 3 || height < 3 {
+    if width < 3 || height < 3 || detail_protect <= 0.0 {
         return mask;
     }
+
+    let edge_floor = (5.0 / detail_protect.max(0.1)).clamp(1.5, 15.0);
+    let edge_span = (8.0 / detail_protect.max(0.1)).clamp(3.0, 20.0);
 
     mask.par_chunks_mut(width).enumerate().for_each(|(y, row_out)| {
         if y == 0 || y == height - 1 {
@@ -67,8 +74,7 @@ fn compute_edge_protection_mask(plane: &[f32], width: usize, height: usize) -> V
             let gy = -3.0 * p00 - 10.0 * p01 - 3.0 * p02 + 3.0 * p20 + 10.0 * p21 + 3.0 * p22;
             let mag = (gx.abs() + gy.abs()) / 32.0;
 
-            // Smooth ramp preserving sharp edges above threshold 6.5
-            row_out[x] = ((mag - 5.0) / 8.0).clamp(0.0, 1.0);
+            row_out[x] = ((mag - edge_floor) / edge_span).clamp(0.0, 1.0);
         }
     });
 
@@ -76,22 +82,41 @@ fn compute_edge_protection_mask(plane: &[f32], width: usize, height: usize) -> V
 }
 
 /// Native Rust Motion-Compensated Temporal Filter (MCTF) and Auto-Degrainer.
-/// Eliminates unwanted compression/mosquito noise while preserving `grain_retain_pct`% of real grain.
+/// Integrates ergonomic user strength & detail protection controls on top of Mutagen auto-tuning.
 pub fn denoise_and_degrain_frame(
-    neighbors: &[Option<&YuvFrame>; 5], // [t-2, t-1, t, t+1, t+2] strictly within same scene
+    neighbors: &[Option<&YuvFrame>; 5],
     profile: &GrainProfile,
     grain_retain_pct: f32,
     protect_lines: bool,
+    denoise_strength: f32,
+    detail_protect: f32,
+    spatial_clamp: bool,
 ) -> YuvFrame {
     let curr = neighbors[2].expect("Center frame t must exist");
     let w = curr.width;
     let h = curr.height;
     let bs = 16usize;
 
-    // 1. Spatial impulse/mosquito cleanup on center frame
-    let y_spatial = spatial_impulse_clamp(&curr.y, w, h);
+    let y_spatial = if spatial_clamp && denoise_strength > 0.0 {
+        spatial_impulse_clamp(&curr.y, w, h)
+    } else {
+        curr.y.clone()
+    };
 
-    // 2. Estimate motion fields from center frame to each available temporal neighbor
+    if denoise_strength <= 0.001 {
+        return YuvFrame {
+            width: w,
+            height: h,
+            chroma_width: curr.chroma_width,
+            chroma_height: curr.chroma_height,
+            bit_depth: curr.bit_depth,
+            subsampling: curr.subsampling,
+            y: y_spatial,
+            u: curr.u.clone(),
+            v: curr.v.clone(),
+        };
+    }
+
     let mvs: Vec<Option<MotionField>> = [0usize, 1, 3, 4]
         .par_iter()
         .map(|&slot| {
@@ -99,23 +124,24 @@ pub fn denoise_and_degrain_frame(
         })
         .collect();
 
-    let edge_mask = if protect_lines {
-        Some(compute_edge_protection_mask(&y_spatial, w, h))
+    let edge_mask = if protect_lines && detail_protect > 0.0 {
+        Some(compute_detail_protection_mask(&y_spatial, w, h, detail_protect))
     } else {
         None
     };
 
-    // Dual thresholds:
-    // - h_noise targets unwanted compression/mosquito noise (always stripped 100%)
-    // - h_total targets unwanted noise + authentic film grain (for full degraining)
-    let h_noise = (profile.unwanted_noise_sigma * 2.4 + (profile.blockiness - 1.0).max(0.0) * 1.8).clamp(1.2, 7.5);
-    let h_total = ((profile.unwanted_noise_sigma + profile.avg_sigma) * 2.6).clamp(h_noise, 16.0);
+    // Scale thresholds by user-configurable --denoise-strength (1.0 = full automatic)
+    let strength = denoise_strength.clamp(0.05, 3.0);
+    let h_noise = ((profile.unwanted_noise_sigma * 2.4 + (profile.blockiness - 1.0).max(0.0) * 1.8)
+        * strength)
+        .clamp(0.8, 12.0);
+    let h_total = (((profile.unwanted_noise_sigma + profile.avg_sigma) * 2.6) * strength)
+        .clamp(h_noise, 24.0);
 
     let inv_2h_noise = 1.0 / (2.0 * h_noise * h_noise);
     let inv_2h_total = 1.0 / (2.0 * h_total * h_total);
     let retain_weight = (grain_retain_pct / 100.0).clamp(0.0, 1.0);
 
-    // 3. Pixel-wise Motion-Compensated Temporal Filtering on Luma
     let mut y_out = vec![0.0f32; w * h];
     let neighbor_slots = [0usize, 1, 3, 4];
 
@@ -142,8 +168,6 @@ pub fn denoise_and_degrain_frame(
                             let sample = sample_bilinear(&ref_frame.y, w, h, (x as f32) + mv.dx, (y as f32) + mv.dy);
                             let diff = sample - c_val;
                             let d2 = diff * diff;
-
-                            // Temporal distance penalty (t+-2 weighted slightly lower than t+-1)
                             let temp_decay = if slot == 0 || slot == 4 { 0.70 } else { 1.0 };
 
                             let wn = mv.confidence * temp_decay * (-d2 * inv_2h_noise).exp();
@@ -160,8 +184,6 @@ pub fn denoise_and_degrain_frame(
 
             let val_noise_clean = acc_noise / w_noise_sum;
             let val_fully_clean = acc_total / w_total_sum;
-
-            // Blend fully clean base with noise-free grained signal according to grain_retain
             let mut blended = val_fully_clean * (1.0 - retain_weight) + val_noise_clean * retain_weight;
 
             if let Some(ref mask) = edge_mask {
@@ -173,7 +195,6 @@ pub fn denoise_and_degrain_frame(
         }
     });
 
-    // 4. Lightweight motion-compensated temporal smoothing on Chroma planes (U, V)
     let cw = curr.chroma_width;
     let ch = curr.chroma_height;
     let (scale_x, scale_y) = match curr.subsampling {
@@ -184,7 +205,7 @@ pub fn denoise_and_degrain_frame(
 
     let clean_chroma = |curr_c: &[f32], get_plane: fn(&YuvFrame) -> &[f32]| -> Vec<f32> {
         let mut c_out = vec![0.0f32; cw * ch];
-        let h_chroma = (h_noise * 1.1).clamp(1.5, 6.0);
+        let h_chroma = (h_noise * 1.1).clamp(1.2, 8.0);
         let inv_2hc = 1.0 / (2.0 * h_chroma * h_chroma);
 
         c_out.par_chunks_mut(cw).enumerate().for_each(|(cy, row_out)| {

@@ -585,15 +585,20 @@ pub fn fallback_analyze_frame(luma: &[f32], width: usize, height: usize) -> Grai
     }
 }
 
+/// Classifies content type while ignoring clipped dark shadows (<=24) and
+/// blown-out specular highlights (>=232) so space/night Live Action is never misclassified as 2D.
 pub fn classify_frame_auto(luma: &[f32], width: usize, height: usize) -> ContentType {
     let block_size = 16;
     let blocks_x = width / block_size;
     let blocks_y = height / block_size;
 
-    let flat_blocks = (0..blocks_y)
+    let stats: Vec<(usize, usize, usize)> = (0..blocks_y)
         .into_par_iter()
         .map(|by| {
-            let mut count = 0;
+            let mut active = 0usize;
+            let mut cel_flat = 0usize;
+            let mut cgi_smooth = 0usize;
+
             for bx in 0..blocks_x {
                 let y_start = by * block_size;
                 let x_start = bx * block_size;
@@ -607,22 +612,41 @@ pub fn classify_frame_auto(luma: &[f32], width: usize, height: usize) -> Content
                         sq_sum += p * p;
                     }
                 }
+
                 let mean = sum / 256.0;
-                let var = (sq_sum / 256.0) - (mean * mean);
-                if var < 7.0 {
-                    count += 1;
+                // Exclude clipped pure blacks/whites (e.g. deep space, letterbox bars, sun glare)
+                if mean <= 24.0 || mean >= 232.0 {
+                    continue;
+                }
+
+                active += 1;
+                let var = ((sq_sum / 256.0) - (mean * mean)).max(0.0);
+
+                // Digital 2D anime flats have ultra-low interior variance (< 1.8)
+                if var < 1.8 {
+                    cel_flat += 1;
+                } else if var < 8.5 {
+                    cgi_smooth += 1;
                 }
             }
-            count
+            (active, cel_flat, cgi_smooth)
         })
-        .sum::<usize>();
+        .collect();
 
-    let total = (blocks_x * blocks_y).max(1);
-    let flat_ratio = (flat_blocks as f32) / (total as f32);
+    let total_active: usize = stats.iter().map(|s| s.0).sum();
+    if total_active < 16 {
+        return ContentType::LiveAction;
+    }
 
-    if flat_ratio > 0.38 {
+    let total_cel: usize = stats.iter().map(|s| s.1).sum();
+    let total_cgi: usize = stats.iter().map(|s| s.2).sum();
+
+    let cel_ratio = (total_cel as f32) / (total_active as f32);
+    let smooth_ratio = ((total_cel + total_cgi) as f32) / (total_active as f32);
+
+    if cel_ratio > 0.28 {
         ContentType::TwoD
-    } else if flat_ratio > 0.18 {
+    } else if smooth_ratio > 0.42 && cel_ratio > 0.12 {
         ContentType::ThreeD
     } else {
         ContentType::LiveAction

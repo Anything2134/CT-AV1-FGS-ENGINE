@@ -29,7 +29,7 @@ use y4m::{Y4mStream, Y4mWriter};
 
 #[derive(Parser, Debug)]
 #[command(name = "CT-AV1-FGS-ENGINE")]
-#[command(version = "2.0.0")]
+#[command(version = "2.1.0")]
 #[command(about = "Modular AV1 Film Grain Synthesis, Motion-Compensated Denoiser, and SVT-AV1 Event Engine")]
 struct Args {
     #[arg(short, long, required_unless_present = "emit_vs_plugin", help = "Path to .vpy script or video container (.mkv, .mp4, .y4m)")]
@@ -53,7 +53,7 @@ struct Args {
     #[arg(long, help = "Temporal rolling lookahead window in scenes (Only valid with full search modes)")]
     lookahead: Option<usize>,
 
-    #[arg(long, help = "Path to Av1an scenes file (JSON or CSV); optional if using built-in av-scenechange detector")]
+    #[arg(long, help = "Path to Av1an scenes file (JSON or CSV); optional if using built-in scene detector")]
     scenes: Option<PathBuf>,
 
     #[arg(long, default_value_t = 1.0, help = "Global grain intensity multiplier")]
@@ -88,6 +88,15 @@ struct Args {
 
     #[arg(long, help = "Native zero-dependency Rust auto-denoised/degrained Y4M output path (use '-' for stdout pipe)")]
     output_y4m: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 1.0, help = "MCTF denoiser strength multiplier (1.0 = full automatic, 0.5 = gentle, 1.5 = strong, 0.0 = off)")]
+    denoise_strength: f32,
+
+    #[arg(long, default_value_t = 1.0, help = "Scharr edge & fine texture protection scale in native denoiser (1.0 = default, higher = preserves more detail)")]
+    denoise_detail_protect: f32,
+
+    #[arg(long, help = "Disable 3x3 spatial mosquito/impulse clamp in native denoiser")]
+    no_spatial_clamp: bool,
 
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, help = "Enable Scharr line-art edge protection in native Rust denoiser")]
     protect_lines: bool,
@@ -173,14 +182,16 @@ fn build_entry_for_profile(
     }
 }
 
-fn make_vs_telemetry(start_f: usize, end_f: usize, prof: &GrainProfile) -> VsSceneTelemetry {
-    let denoise_thsad = (prof.unwanted_noise_sigma * 75.0
+fn make_vs_telemetry(start_f: usize, end_f: usize, prof: &GrainProfile, denoise_strength: f32) -> VsSceneTelemetry {
+    let s = denoise_strength.clamp(0.1, 3.0);
+    let denoise_thsad = ((prof.unwanted_noise_sigma * 75.0
         + (prof.blockiness - 1.0).max(0.0) * 55.0)
+        * s)
         .round()
-        .clamp(40.0, 220.0) as u32;
-    let degrain_thsad = ((prof.unwanted_noise_sigma + prof.avg_sigma) * 75.0)
+        .clamp(40.0, 260.0) as u32;
+    let degrain_thsad = (((prof.unwanted_noise_sigma + prof.avg_sigma) * 75.0) * s)
         .round()
-        .clamp(denoise_thsad as f32, 360.0) as u32;
+        .clamp(denoise_thsad as f32, 380.0) as u32;
 
     VsSceneTelemetry {
         start_frame: start_f,
@@ -255,7 +266,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let target_iso: Option<u32> = args.iso.or_else(|| args.photon_noise.map(|n| (n as u32) * 100));
 
-    eprintln!("[*] Initializing CT-AV1-FGS-ENGINE v2.0.0 (Modular Apache-2.0)...");
+    eprintln!("[*] Initializing CT-AV1-FGS-ENGINE v2.1.0 (Modular Apache-2.0)...");
     let mut stream = Y4mStream::from_input(input_path)?;
 
     let effective_transfer = match args.transfer {
@@ -275,8 +286,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let retention_scale = compute_fgs_retention_scale(args.grain_retain, args.fgs_balance);
     if args.grain_retain > 0.0 || args.output_y4m.is_some() || args.export_vs_profile.is_some() {
         eprintln!(
-            "    - Grain Retention: {:.1}% | FGS Balance: {:?} (FGS Scale: {:.3})",
-            args.grain_retain, args.fgs_balance, retention_scale
+            "    - Grain Retention: {:.1}% | FGS Balance: {:?} (FGS Scale: {:.3}) | Denoise Strength: {:.2}x",
+            args.grain_retain, args.fgs_balance, retention_scale, args.denoise_strength
         );
     }
 
@@ -293,11 +304,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut vs_telemetry: Vec<VsSceneTelemetry> = Vec::new();
     let mut lookahead_queue: VecDeque<GrainProfile> = VecDeque::new();
 
-    // ---------------------------------------------------------------------
-    // MODE A: NATIVE RUST MCTF AUTO-DENOISER & Y4M OUTPUT (--output-y4m)
-    // ---------------------------------------------------------------------
     if let Some(ref y4m_out_path) = args.output_y4m {
-        eprintln!("[*] Native Rust Motion-Compensated Auto-Denoiser & Auto-Degrainer active -> {}", y4m_out_path.display());
+        eprintln!(
+            "[*] Native Rust Motion-Compensated Denoiser (Strength: {:.2}x, Detail Protect: {:.2}x) -> {}",
+            args.denoise_strength, args.denoise_detail_protect, y4m_out_path.display()
+        );
         let mut y4m_writer = Y4mWriter::create(y4m_out_path, &stream.raw_header_line, stream.bit_depth)?;
 
         let provided_scenes = if let Some(ref sc_path) = args.scenes {
@@ -307,14 +318,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let mut scene_detector = SceneDetector::new(12, 300);
-        let mut ring: VecDeque<(usize, YuvFrame, usize)> = VecDeque::new(); // (frame_idx, frame, scene_id)
+        let mut ring: VecDeque<(usize, YuvFrame, usize)> = VecDeque::new();
         let mut current_scene_id = 0usize;
         let mut current_scene_start = 0usize;
         let mut active_scene_prof: Option<GrainProfile> = None;
         let mut eof_reached = false;
         let mut next_frame_idx = 0usize;
 
-        // Pre-fill initial frames into 5-frame lookahead ring buffer
         while ring.len() < 3 && !eof_reached {
             if let Some(frame) = stream.read_next_yuv_frame() {
                 let ctype = *content_type_opt.get_or_insert_with(|| {
@@ -354,7 +364,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        let content_type = content_type_opt.unwrap_or(ContentType::TwoD);
+        let content_type = content_type_opt.unwrap_or(ContentType::LiveAction);
         let (analysis_ctype, effective_tune_intensity) = if is_tuning_active && args.force_bypass >= 1 {
             let eff_int = if args.force_bypass == 1 { 1.0 } else { args.intensity };
             (ContentType::LiveAction, eff_int)
@@ -366,7 +376,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut last_recorded_scene_id = usize::MAX;
 
         while center_pos < ring.len() {
-            // Keep reading ahead so center_pos has up to 2 future neighbors
             while ring.len() - center_pos <= 2 && !eof_reached {
                 if let Some(frame) = stream.read_next_yuv_frame() {
                     let is_cut = if let Some(ref scenes) = provided_scenes {
@@ -376,7 +385,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     if is_cut {
-                        // Record previous scene FGS entry
                         if let Some(ref prev_prof) = active_scene_prof {
                             entries.push(build_entry_for_profile(
                                 current_scene_start,
@@ -392,7 +400,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 stream.width,
                                 stream.height,
                             ));
-                            vs_telemetry.push(make_vs_telemetry(current_scene_start, next_frame_idx, prev_prof));
+                            vs_telemetry.push(make_vs_telemetry(current_scene_start, next_frame_idx, prev_prof, args.denoise_strength));
                         }
                         current_scene_id += 1;
                         current_scene_start = next_frame_idx;
@@ -422,7 +430,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 active_scene_prof = Some(smooth_profile(&mut lookahead_queue, prof, lookahead_window));
             }
 
-            // Assemble 5-frame temporal window strictly restricted to same scene_id (zero cross-cut ghosting)
             let get_same_scene = |offset: isize| -> Option<&YuvFrame> {
                 let pos = center_pos as isize + offset;
                 if pos >= 0 && (pos as usize) < ring.len() && ring[pos as usize].2 == c_sid {
@@ -441,7 +448,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ];
 
             let prof_ref = active_scene_prof.as_ref().unwrap();
-            let cleaned_frame = denoise_and_degrain_frame(&neighbors, prof_ref, args.grain_retain, args.protect_lines);
+            let cleaned_frame = denoise_and_degrain_frame(
+                &neighbors,
+                prof_ref,
+                args.grain_retain,
+                args.protect_lines,
+                args.denoise_strength,
+                args.denoise_detail_protect,
+                !args.no_spatial_clamp,
+            );
             y4m_writer.write_frame(&cleaned_frame)?;
 
             if c_idx % 120 == 0 {
@@ -455,7 +470,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Flush final scene FGS entry
         if let Some(ref prof) = active_scene_prof {
             entries.push(build_entry_for_profile(
                 current_scene_start,
@@ -471,15 +485,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stream.width,
                 stream.height,
             ));
-            vs_telemetry.push(make_vs_telemetry(current_scene_start, next_frame_idx.max(current_scene_start + 1), prof));
+            vs_telemetry.push(make_vs_telemetry(current_scene_start, next_frame_idx.max(current_scene_start + 1), prof, args.denoise_strength));
         }
 
         y4m_writer.flush()?;
-    }
-    // ---------------------------------------------------------------------
-    // MODE B: TEMPORAL SCENE-BY-SCENE ANALYSIS (NO Y4M OUTPUT)
-    // ---------------------------------------------------------------------
-    else if args.fg_search_full || args.forced_fg_search_full {
+    } else if args.fg_search_full || args.forced_fg_search_full {
         let first_frame = stream.read_next_luma_only().ok_or("Failed to read initial luma frame")?;
         let content_type = if let Some(forced) = args.force_type {
             eprintln!("[*] Content type forced by user: {:?}", forced);
@@ -510,7 +520,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for (idx, seg) in segments.iter().enumerate() {
                 let mid_point = (seg.start_frame + seg.end_frame) / 2;
 
-                // Read (mid - 1) and (mid) so Mutagen has motion-compensated temporal verification!
                 let target_prev = mid_point.saturating_sub(1);
                 if stream.current_frame < target_prev {
                     let to_skip = target_prev - stream.current_frame;
@@ -555,7 +564,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stream.width,
                     stream.height,
                 ));
-                vs_telemetry.push(make_vs_telemetry(seg.start_frame, seg.end_frame, &prof));
+                vs_telemetry.push(make_vs_telemetry(seg.start_frame, seg.end_frame, &prof, args.denoise_strength));
 
                 if idx % 10 == 0 || idx == segments.len() - 1 {
                     eprintln!(
@@ -572,8 +581,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else {
-            // Single-pass native av-scenechange detector when --scenes is omitted
-            eprintln!("[*] Running single-pass native av-scenechange detector (no --scenes provided)...");
+            eprintln!("[*] Running single-pass native scene detector (no --scenes provided)...");
             let mut scene_detector = SceneDetector::new(12, 300);
             scene_detector.check_scenecut(&first_frame, stream.width, stream.height, 0);
 
@@ -585,7 +593,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             while let Some(curr_luma) = stream.read_next_luma_only() {
                 let is_cut = scene_detector.check_scenecut(&curr_luma, stream.width, stream.height, frame_idx);
 
-                // Sample a representative motion pair near the middle of the ongoing scene
                 if frame_idx.saturating_sub(scene_start) == 24 || scene_mid_pair.is_none() {
                     scene_mid_pair = Some((prev_luma.clone(), curr_luma.clone()));
                 }
@@ -614,7 +621,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         stream.width,
                         stream.height,
                     ));
-                    vs_telemetry.push(make_vs_telemetry(scene_start, frame_idx, &prof));
+                    vs_telemetry.push(make_vs_telemetry(scene_start, frame_idx, &prof, args.denoise_strength));
 
                     eprintln!(
                         "    - Native Scene {} [{}..{}]: Luma={:.1} | Grain={:.2} | Lag={}",
@@ -657,14 +664,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stream.width,
                     stream.height,
                 ));
-                vs_telemetry.push(make_vs_telemetry(scene_start, frame_idx, &prof));
+                vs_telemetry.push(make_vs_telemetry(scene_start, frame_idx, &prof, args.denoise_strength));
             }
         }
-    }
-    // ---------------------------------------------------------------------
-    // MODE C: FAST GLOBAL STATIC TABLE
-    // ---------------------------------------------------------------------
-    else {
+    } else {
         eprintln!("[*] Generating fast static global FGS table...");
         let frame0 = stream.read_next_luma_only().ok_or("Failed to read frame 0")?;
         let frame1_opt = stream.read_next_luma_only();
@@ -710,11 +713,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stream.width,
             stream.height,
         );
-        vs_telemetry.push(make_vs_telemetry(0, 999999999, &prof));
+        vs_telemetry.push(make_vs_telemetry(0, 999999999, &prof, args.denoise_strength));
         entries.push(entry);
     }
 
-    // Write primary filmgrn1 table
     let effective_time_unit = if entries.len() == 1 && entries[0].end_frame == usize::MAX {
         TimeUnitMode::Global
     } else {

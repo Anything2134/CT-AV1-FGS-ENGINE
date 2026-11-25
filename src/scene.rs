@@ -1,13 +1,14 @@
 use crate::motion::{downsample_2x, estimate_motion_field, satd_4x4};
 use crate::types::SceneSegment;
 use rayon::prelude::*;
+use std::collections::VecDeque;
 use std::path::Path;
 
-/// Evaluates directional spatial intra complexity via 4x4 Hadamard SATD (av-scenechange style).
+/// Evaluates directional spatial intra complexity via 4x4 Hadamard SATD.
 pub fn estimate_intra_cost(plane: &[f32], width: usize, height: usize) -> f64 {
     let bx_count = width / 8;
     let by_count = height / 8;
-    if bx_count == 0 || by_count == 0 {
+    if bx_count <= 1 || by_count <= 1 {
         return 1.0;
     }
 
@@ -19,13 +20,11 @@ pub fn estimate_intra_cost(plane: &[f32], width: usize, height: usize) -> f64 {
                 let y0 = by * 8;
                 let x0 = bx * 8;
 
-                // Evaluate simple DC & directional predictors per 4x4 sub-block
                 for sy in 0..2 {
                     for sx in 0..2 {
                         let py = y0 + sy * 4;
                         let px = x0 + sx * 4;
 
-                        // DC prediction from top and left boundary pixels
                         let mut dc_acc = 0.0f32;
                         for k in 0..4 {
                             dc_acc += plane[(py - 1) * width + px + k];
@@ -60,6 +59,30 @@ pub fn estimate_intra_cost(plane: &[f32], width: usize, height: usize) -> f64 {
 
     let count = ((bx_count - 1) * (by_count - 1)).max(1) as f64;
     total_cost / count
+}
+
+/// Computes normalized 32-bin luma histogram distance (Bhattacharyya-like metric).
+fn compute_hist_distance(curr: &[f32], prev: &[f32]) -> f64 {
+    let mut h_curr = [0.0f64; 32];
+    let mut h_prev = [0.0f64; 32];
+
+    for &p in curr {
+        let bin = ((p / 8.0) as usize).min(31);
+        h_curr[bin] += 1.0;
+    }
+    for &p in prev {
+        let bin = ((p / 8.0) as usize).min(31);
+        h_prev[bin] += 1.0;
+    }
+
+    let n_curr = curr.len().max(1) as f64;
+    let n_prev = prev.len().max(1) as f64;
+
+    let mut b_coeff = 0.0f64;
+    for i in 0..32 {
+        b_coeff += ((h_curr[i] / n_curr) * (h_prev[i] / n_prev)).sqrt();
+    }
+    (1.0 - b_coeff).clamp(0.0, 1.0)
 }
 
 /// Evaluates structural importance block difference between consecutive frames.
@@ -98,8 +121,6 @@ pub fn estimate_importance_block_diff(curr: &[f32], prev: &[f32], width: usize, 
                 let mean_c = sum_c / 64.0;
                 let var_c = ((sq_c / 64.0) - mean_c * mean_c).max(0.0);
                 let mean_delta = (sum_c - sum_p).abs() / 64.0;
-
-                // Weight temporal difference by spatial block variance importance
                 let imp_weight = (1.0 + var_c.sqrt() * 0.05) as f64;
                 row_diff += ((sad / 64.0) as f64 + mean_delta as f64) * imp_weight;
             }
@@ -110,15 +131,14 @@ pub fn estimate_importance_block_diff(curr: &[f32], prev: &[f32], width: usize, 
     total_diff / ((bx_count * by_count).max(1) as f64)
 }
 
-/// Native scene cut detector combining av-scenechange's Intra/Inter SATD and Importance metrics.
+/// Native scene cut detector combining av-scenechange Intra/Inter SATD, Importance Diff,
+/// Luma Histogram shift, and rolling window outlier detection.
 pub struct SceneDetector {
     pub min_scenecut: usize,
     pub max_scenecut: usize,
     prev_ds: Option<Vec<f32>>,
-    ds_width: usize,
-    ds_height: usize,
     last_cut_frame: usize,
-    prev_inter_cost: f64,
+    inter_history: VecDeque<f64>,
 }
 
 impl SceneDetector {
@@ -127,18 +147,13 @@ impl SceneDetector {
             min_scenecut,
             max_scenecut,
             prev_ds: None,
-            ds_width: 0,
-            ds_height: 0,
             last_cut_frame: 0,
-            prev_inter_cost: 0.0,
+            inter_history: VecDeque::with_capacity(12),
         }
     }
 
-    /// Evaluates if `frame_idx` is an optimal scene cut boundary.
     pub fn check_scenecut(&mut self, luma: &[f32], width: usize, height: usize, frame_idx: usize) -> bool {
         let (curr_ds, dw, dh) = downsample_2x(luma, width, height);
-        self.ds_width = dw;
-        self.ds_height = dh;
 
         let Some(ref prev_ds) = self.prev_ds else {
             self.prev_ds = Some(curr_ds);
@@ -149,6 +164,7 @@ impl SceneDetector {
         if dist >= self.max_scenecut {
             self.last_cut_frame = frame_idx;
             self.prev_ds = Some(curr_ds);
+            self.inter_history.clear();
             return true;
         }
 
@@ -157,8 +173,7 @@ impl SceneDetector {
             return false;
         }
 
-        // Compute Intra SATD, Motion-Compensated Inter SATD, and Importance Block Diff in parallel
-        let (intra_cost, (inter_cost, imp_diff)) = rayon::join(
+        let (intra_cost, (inter_cost, (imp_diff, hist_dist))) = rayon::join(
             || estimate_intra_cost(&curr_ds, dw, dh),
             || {
                 rayon::join(
@@ -170,23 +185,41 @@ impl SceneDetector {
                             mf.vectors.iter().map(|v| v.satd as f64).sum::<f64>() / (mf.vectors.len() as f64)
                         }
                     },
-                    || estimate_importance_block_diff(&curr_ds, prev_ds, dw, dh),
+                    || {
+                        rayon::join(
+                            || estimate_importance_block_diff(&curr_ds, prev_ds, dw, dh),
+                            || compute_hist_distance(&curr_ds, prev_ds),
+                        )
+                    },
                 )
             },
         );
 
+        let avg_hist_inter = if self.inter_history.is_empty() {
+            inter_cost.max(1.0)
+        } else {
+            self.inter_history.iter().sum::<f64>() / (self.inter_history.len() as f64)
+        };
+
         const BIAS: f64 = 0.70;
         let threshold = (intra_cost / 16.0) * (1.0 - BIAS);
 
-        // Flash protection: avoid triggering on single-frame brightness spikes that immediately settle
-        let is_cut = (inter_cost > threshold.max(8.5) && imp_diff > 10.0)
-            || (inter_cost > self.prev_inter_cost * 3.2 && imp_diff > 14.0);
+        // Require both structural SATD shift and global histogram/importance corroboration
+        let strong_satd_cut = inter_cost > threshold.max(7.5) && imp_diff > 9.5 && hist_dist > 0.045;
+        let relative_spike_cut =
+            inter_cost > avg_hist_inter * 2.8 && imp_diff > 12.0 && hist_dist > 0.07;
 
-        self.prev_inter_cost = inter_cost;
+        let is_cut = strong_satd_cut || relative_spike_cut;
+
+        self.inter_history.push_back(inter_cost);
+        if self.inter_history.len() > 10 {
+            self.inter_history.pop_front();
+        }
         self.prev_ds = Some(curr_ds);
 
         if is_cut {
             self.last_cut_frame = frame_idx;
+            self.inter_history.clear();
             true
         } else {
             false
@@ -194,7 +227,6 @@ impl SceneDetector {
     }
 }
 
-/// Parses Av1an JSON or CSV scenes files with strict chronological deduplication.
 pub fn parse_av1an_scenes(path: &Path) -> Result<Vec<SceneSegment>, String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("Failed to open scenes file: {e}"))?;
     let mut raw_segments = Vec::new();

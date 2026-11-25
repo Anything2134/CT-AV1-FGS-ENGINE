@@ -1,6 +1,6 @@
 [package]
 name = "ct-av1-fgs-engine"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["Anything2134"]
 description = "CT-AV1-FGS-ENGINE: Modular Rust AV1 Film Grain Synthesis, Motion-Compensated Denoiser, and SVT-AV1 Event Engine"
