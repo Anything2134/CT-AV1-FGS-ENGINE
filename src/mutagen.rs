@@ -586,7 +586,8 @@ pub fn fallback_analyze_frame(luma: &[f32], width: usize, height: usize) -> Grai
 }
 
 /// Classifies content type while ignoring clipped dark shadows (<=24) and
-/// blown-out specular highlights (>=232) so space/night Live Action is never misclassified as 2D.
+/// blown-out specular highlights (>=232), measuring consecutive identical pixel runs
+/// to distinguish true flat 2D cel fills and 3D CGI shading from smooth Live Action gradients.
 pub fn classify_frame_auto(luma: &[f32], width: usize, height: usize) -> ContentType {
     let block_size = 16;
     let blocks_x = width / block_size;
@@ -604,28 +605,32 @@ pub fn classify_frame_auto(luma: &[f32], width: usize, height: usize) -> Content
                 let x_start = bx * block_size;
                 let mut sum = 0.0f32;
                 let mut sq_sum = 0.0f32;
+                let mut identical_pairs = 0usize;
 
                 for y in 0..block_size {
+                    let row = (y_start + y) * width + x_start;
                     for x in 0..block_size {
-                        let p = luma[(y_start + y) * width + (x_start + x)];
+                        let p = luma[row + x];
                         sum += p;
                         sq_sum += p * p;
+                        if x + 1 < block_size && (p - luma[row + x + 1]).abs() < 0.15 {
+                            identical_pairs += 1;
+                        }
                     }
                 }
 
                 let mean = sum / 256.0;
-                // Exclude clipped pure blacks/whites (e.g. deep space, letterbox bars, sun glare)
                 if mean <= 24.0 || mean >= 232.0 {
                     continue;
                 }
 
                 active += 1;
                 let var = ((sq_sum / 256.0) - (mean * mean)).max(0.0);
+                let zero_diff_ratio = (identical_pairs as f32) / 240.0;
 
-                // Digital 2D anime flats have ultra-low interior variance (< 1.8)
-                if var < 1.8 {
+                if var < 1.6 && zero_diff_ratio > 0.55 {
                     cel_flat += 1;
-                } else if var < 8.5 {
+                } else if var < 8.5 && zero_diff_ratio > 0.42 {
                     cgi_smooth += 1;
                 }
             }
@@ -644,9 +649,9 @@ pub fn classify_frame_auto(luma: &[f32], width: usize, height: usize) -> Content
     let cel_ratio = (total_cel as f32) / (total_active as f32);
     let smooth_ratio = ((total_cel + total_cgi) as f32) / (total_active as f32);
 
-    if cel_ratio > 0.28 {
+    if cel_ratio > 0.34 {
         ContentType::TwoD
-    } else if smooth_ratio > 0.42 && cel_ratio > 0.12 {
+    } else if smooth_ratio > 0.48 && cel_ratio > 0.18 {
         ContentType::ThreeD
     } else {
         ContentType::LiveAction
