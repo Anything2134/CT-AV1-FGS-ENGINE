@@ -17,12 +17,12 @@ use fgs_out::{
 };
 use motion::estimate_motion_field;
 use mutagen::{
-    classify_frame_auto, default_70mm_ar_coeffs, fallback_analyze_frame, generate_iso_photon_profile,
+    classify_frame_auto, fallback_analyze_frame, generate_iso_photon_profile,
     get_subtle_70mm_profile, MutagenEngine,
 };
 use scene::{parse_av1an_scenes, SceneDetector};
 use types::{
-    ContentType, FgsBalanceMode, FgsTableEntry, GrainProfile, MutagenState, SceneSegment,
+    ContentType, FgsBalanceMode, FgsTableEntry, GrainProfile, MutagenState,
     TimeUnitMode, TransferCurve, VsSceneTelemetry, YuvFrame,
 };
 use y4m::{Y4mStream, Y4mWriter};

@@ -2,9 +2,12 @@ use crate::types::{ChromaSubsampling, TransferCurve, YuvFrame};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread::JoinHandle;
 
 pub struct Y4mStream {
+    child: Option<Child>,
+    _stderr_thread: Option<JoinHandle<String>>,
     reader: BufReader<Box<dyn Read + Send>>,
     pub width: usize,
     pub height: usize,
@@ -22,8 +25,17 @@ pub struct Y4mStream {
     chroma_plane_bytes: usize,
 }
 
+impl Drop for Y4mStream {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
 impl Y4mStream {
-    /// Opens a Y4M pipe from VapourSynth (.vpy) or FFmpeg (media containers).
+    /// Opens a Y4M pipe from VapourSynth (.vpy), FFmpeg (media containers), or raw .y4m files.
     pub fn from_input(path: &Path) -> Result<Self, String> {
         if !path.exists() {
             return Err(format!("File does not exist at path: '{}'.", path.display()));
@@ -32,9 +44,13 @@ impl Y4mStream {
         let is_vpy = path.extension().and_then(|s| s.to_str()) == Some("vpy");
         let is_y4m = path.extension().and_then(|s| s.to_str()) == Some("y4m");
 
-        let stdout: Box<dyn Read + Send> = if is_y4m {
+        let (mut child_opt, mut stderr_thread, stdout): (
+            Option<Child>,
+            Option<JoinHandle<String>>,
+            Box<dyn Read + Send>,
+        ) = if is_y4m {
             let file = File::open(path).map_err(|e| format!("Failed to open Y4M file: {e}"))?;
-            Box::new(file)
+            (None, None, Box::new(file))
         } else {
             let mut child = if is_vpy {
                 Command::new("vspipe")
@@ -48,12 +64,16 @@ impl Y4mStream {
                     .spawn()
                     .map_err(|e| format!("Failed to spawn vspipe: {e}"))?
             } else {
+                // Convert only unsupported formats (e.g. yuvj420p, nv12, rgb24) while passing
+                // through native 8/10/12/16-bit planar YUV formats untouched.
                 Command::new("ffmpeg")
                     .arg("-nostdin")
                     .arg("-i")
                     .arg(path)
                     .arg("-map")
                     .arg("0:v:0")
+                    .arg("-vf")
+                    .arg("format=yuv420p|yuv422p|yuv444p|yuv420p10le|yuv422p10le|yuv444p10le|yuv420p12le|yuv422p12le|yuv444p12le|yuv420p16le|yuv422p16le|yuv444p16le")
                     .arg("-strict")
                     .arg("-1")
                     .arg("-f")
@@ -67,20 +87,48 @@ impl Y4mStream {
             };
 
             let out = child.stdout.take().ok_or("Failed to capture child stdout")?;
-            Box::new(out)
+            let err_handle = child.stderr.take().map(|mut err| {
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while let Ok(n) = err.read(&mut chunk) {
+                        if n == 0 {
+                            break;
+                        }
+                        if buf.len() < 32768 {
+                            let take_n = n.min(32768 - buf.len());
+                            buf.extend_from_slice(&chunk[..take_n]);
+                        }
+                    }
+                    String::from_utf8_lossy(&buf).into_owned()
+                })
+            });
+
+            (Some(child), err_handle, Box::new(out))
         };
 
         let mut reader = BufReader::with_capacity(2 * 1024 * 1024, stdout);
 
         let mut header = String::new();
-        reader
-            .read_line(&mut header)
-            .map_err(|e| format!("Error reading Y4M header: {e}"))?;
+        let read_res = reader.read_line(&mut header);
 
-        if !header.starts_with("YUV4MPEG2") {
+        if read_res.is_err() || !header.starts_with("YUV4MPEG2") {
+            if let Some(mut c) = child_opt.take() {
+                let _ = c.wait();
+            }
+            let stderr_msg = stderr_thread
+                .take()
+                .and_then(|h| h.join().ok())
+                .unwrap_or_default();
+
             return Err(format!(
-                "Invalid Y4M header received: '{}'. Verify input file and ffmpeg/vspipe installation.",
-                header.trim()
+                "Invalid Y4M header received: '{}'.\nProcess stderr:\n{}",
+                header.trim(),
+                if stderr_msg.trim().is_empty() {
+                    "No stderr output (verify input path and ffmpeg/vspipe installation)."
+                } else {
+                    stderr_msg.trim()
+                }
             ));
         }
 
@@ -150,6 +198,8 @@ impl Y4mStream {
         let chroma_plane_bytes = chroma_width * chroma_height * bytes_per_sample;
 
         Ok(Self {
+            child: child_opt,
+            _stderr_thread: stderr_thread,
             reader,
             width,
             height,
@@ -187,7 +237,6 @@ impl Y4mStream {
         }
     }
 
-    /// Reads only the normalized luma plane and skips chroma bytes in-place for fast analysis.
     pub fn read_next_luma_only(&mut self) -> Option<Vec<f32>> {
         if self.read_frame_header().is_err() {
             return None;
@@ -203,7 +252,6 @@ impl Y4mStream {
         Some(self.decode_plane(&raw_y))
     }
 
-    /// Reads a complete YUV frame normalized to 0.0..255.0 floats across all planes.
     pub fn read_next_yuv_frame(&mut self) -> Option<YuvFrame> {
         if self.read_frame_header().is_err() {
             return None;
@@ -235,7 +283,6 @@ impl Y4mStream {
         })
     }
 
-    /// Skips N full frames cleanly by consuming buffer pointers without extra allocations.
     pub fn skip_frames(&mut self, count: usize) -> bool {
         let payload = self.luma_bytes + self.chroma_plane_bytes * 2;
         for _ in 0..count {
@@ -271,7 +318,6 @@ pub struct Y4mWriter {
 }
 
 impl Y4mWriter {
-    /// Creates a Y4M output stream to stdout ("-") or a target file path.
     pub fn create(target: &Path, header_line: &str, bit_depth: usize) -> std::io::Result<Self> {
         let dest: Box<dyn Write> = if target.as_os_str() == "-" {
             Box::new(std::io::stdout())

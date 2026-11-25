@@ -77,6 +77,7 @@ pub struct SceneSegment {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)]
 pub struct MotionVector {
     pub dx: f32,
     pub dy: f32,
@@ -86,6 +87,7 @@ pub struct MotionVector {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct MotionField {
     pub cols: usize,
     pub rows: usize,
