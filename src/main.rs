@@ -7,12 +7,12 @@ mod types;
 mod y4m;
 
 use clap::Parser;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 use denoiser::denoise_and_degrain_frame;
 use fgs_out::{
-    compute_fgs_retention_scale, rand_seed, write_av1an_chunk_tables, write_fgs_events_jsonl,
+    compute_fgs_retention_scale, rand_seed, write_av1an_chunks_and_zones, write_fgs_events_jsonl,
     write_filmgrn1_table, write_svt_c_bridge, write_vs_plugin_module, write_vs_telemetry_json,
 };
 use motion::estimate_motion_field;
@@ -22,14 +22,14 @@ use mutagen::{
 };
 use scene::{parse_av1an_scenes, SceneDetector};
 use types::{
-    ContentType, FgsBalanceMode, FgsTableEntry, GrainProfile, MutagenState,
-    TimeUnitMode, TransferCurve, VsSceneTelemetry, YuvFrame,
+    Av1anEncoder, ColorRange, ContentType, FgsBalanceMode, FgsTableEntry, GrainProfile,
+    MutagenState, TimeUnitMode, TransferCurve, VsSceneTelemetry, YuvFrame,
 };
 use y4m::{Y4mStream, Y4mWriter};
 
 #[derive(Parser, Debug)]
 #[command(name = "CT-AV1-FGS-ENGINE")]
-#[command(version = "2.1.0")]
+#[command(version = "2.3.0")]
 #[command(about = "Modular AV1 Film Grain Synthesis, Motion-Compensated Denoiser, and SVT-AV1 Event Engine")]
 struct Args {
     #[arg(short, long, required_unless_present = "emit_vs_plugin", help = "Path to .vpy script or video container (.mkv, .mp4, .y4m)")]
@@ -53,7 +53,7 @@ struct Args {
     #[arg(long, help = "Temporal rolling lookahead window in scenes (Only valid with full search modes)")]
     lookahead: Option<usize>,
 
-    #[arg(long, help = "Path to Av1an scenes file (JSON or CSV); optional if using built-in scene detector")]
+    #[arg(long, help = "Path to Av1an scenes file (JSON or CSV); omit when VapourSynth alters frame count via Trim/IVTC")]
     scenes: Option<PathBuf>,
 
     #[arg(long, default_value_t = 1.0, help = "Global grain intensity multiplier")]
@@ -80,6 +80,9 @@ struct Args {
     #[arg(long, value_enum, default_value = "auto", help = "Transfer curve for ISO photon noise (auto, sdr, pq, hlg)")]
     transfer: TransferCurve,
 
+    #[arg(long, value_enum, default_value = "auto", help = "Input color range (auto, limited, full)")]
+    color_range: ColorRange,
+
     #[arg(long, default_value_t = 0.0, value_parser = clap::value_parser!(f32), help = "Percentage (0.0..100.0) of film grain retained after auto-degraining")]
     grain_retain: f32,
 
@@ -89,10 +92,10 @@ struct Args {
     #[arg(long, help = "Native zero-dependency Rust auto-denoised/degrained Y4M output path (use '-' for stdout pipe)")]
     output_y4m: Option<PathBuf>,
 
-    #[arg(long, default_value_t = 1.0, help = "MCTF denoiser strength multiplier (1.0 = full automatic, 0.5 = gentle, 1.5 = strong, 0.0 = off)")]
+    #[arg(long, default_value_t = 1.0, help = "MCTF + Bilateral denoiser strength multiplier (1.0 = full automatic, 0.5 = gentle, 0.0 = off)")]
     denoise_strength: f32,
 
-    #[arg(long, default_value_t = 1.0, help = "Scharr edge & fine texture protection scale in native denoiser (1.0 = default, higher = preserves more detail)")]
+    #[arg(long, default_value_t = 1.0, help = "Scharr edge & fine texture protection scale in native denoiser (higher preserves more detail)")]
     denoise_detail_protect: f32,
 
     #[arg(long, help = "Disable 3x3 spatial mosquito/impulse clamp in native denoiser")]
@@ -101,11 +104,23 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, help = "Enable Scharr line-art edge protection in native Rust denoiser")]
     protect_lines: bool,
 
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, help = "Enable 4x4 Bayer dithering when encoding denoised Y4M output")]
+    dither: bool,
+
     #[arg(long, value_enum, default_value = "100ns", help = "Timestamp unit in filmgrn1 table (100ns: SVT-AV1 4.3.0+ standard, frames, global)")]
     time_unit: TimeUnitMode,
 
-    #[arg(long, help = "Directory to emit per-chunk t=0 .tbl files for Av1an multi-worker encoding")]
+    #[arg(long, help = "Directory to emit merged t=0 zone/chunk .tbl files for Av1an")]
     emit_chunk_tables: Option<PathBuf>,
+
+    #[arg(long, help = "Generate ready-to-use Av1an --zones file pointing to merged per-zone .tbl files")]
+    emit_av1an_zones: Option<PathBuf>,
+
+    #[arg(long, value_enum, default_value = "svt-av1", help = "Target encoder syntax inside Av1an zones file (svt-av1, aom, rav1e)")]
+    av1an_encoder: Av1anEncoder,
+
+    #[arg(long, default_value_t = 1.0, help = "Merge consecutive scenes into one Av1an zone if mean sY delta <= threshold")]
+    zone_merge_threshold: f32,
 
     #[arg(long, help = "Emit per-scene FILM_GRAIN_EVENT JSONL stream for SVT-AV1 4.3.0+")]
     emit_fgs_events: Option<PathBuf>,
@@ -129,6 +144,7 @@ fn build_entry_for_profile(
     digital_noise_mode: Option<u8>,
     target_iso: Option<u32>,
     effective_transfer: TransferCurve,
+    effective_range: ColorRange,
     effective_tune_intensity: f32,
     retention_scale: f32,
     width: usize,
@@ -157,8 +173,14 @@ fn build_entry_for_profile(
 
     if let Some(iso_val) = target_iso {
         let pure_digital = digital_noise_mode == Some(1);
-        let (lag, ar_coeffs, iso_sy) =
-            generate_iso_photon_profile(iso_val, width, height, effective_transfer, pure_digital);
+        let (lag, ar_coeffs, iso_sy) = generate_iso_photon_profile(
+            iso_val,
+            width,
+            height,
+            effective_transfer,
+            effective_range,
+            pure_digital,
+        );
         return FgsTableEntry {
             start_frame: start_f,
             end_frame: end_f,
@@ -170,7 +192,7 @@ fn build_entry_for_profile(
         };
     }
 
-    let (lag, ar_coeffs, subtle_sy) = get_subtle_70mm_profile(content_type, prof.mean_luma);
+    let (lag, ar_coeffs, subtle_sy) = get_subtle_70mm_profile(content_type, prof.mean_luma, effective_range);
     FgsTableEntry {
         start_frame: start_f,
         end_frame: end_f,
@@ -222,6 +244,8 @@ fn smooth_profile(window: &mut VecDeque<GrainProfile>, current: GrainProfile, ma
         unwanted_noise_sigma: window.iter().map(|p| p.unwanted_noise_sigma).sum::<f32>() / len_f,
         blockiness: window.iter().map(|p| p.blockiness).sum::<f32>() / len_f,
         mean_luma: window.iter().map(|p| p.mean_luma).sum::<f32>() / len_f,
+        texture_complexity: window.iter().map(|p| p.texture_complexity).sum::<f32>() / len_f,
+        hf_ratio: window.iter().map(|p| p.hf_ratio).sum::<f32>() / len_f,
     }
 }
 
@@ -266,17 +290,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let target_iso: Option<u32> = args.iso.or_else(|| args.photon_noise.map(|n| (n as u32) * 100));
 
-    eprintln!("[*] Initializing CT-AV1-FGS-ENGINE v2.1.0 (Modular Apache-2.0)...");
+    eprintln!("[*] Initializing CT-AV1-FGS-ENGINE v2.3.0 (Modular Apache-2.0)...");
     let mut stream = Y4mStream::from_input(input_path)?;
 
     let effective_transfer = match args.transfer {
         TransferCurve::Auto => stream.detected_transfer,
         other => other,
     };
+    let effective_range = match args.color_range {
+        ColorRange::Auto => stream.detected_range,
+        other => other,
+    };
 
     eprintln!(
-        "    - Stream: {}x{} | {}-bit | FPS: {}/{} | Transfer: {:?}",
-        stream.width, stream.height, stream.bit_depth, stream.fps_num, stream.fps_den, effective_transfer
+        "    - Stream: {}x{} | {}-bit | {:?} | FPS: {}/{} | Transfer: {:?} | Range: {:?}",
+        stream.width,
+        stream.height,
+        stream.bit_depth,
+        stream.subsampling,
+        stream.fps_num,
+        stream.fps_den,
+        effective_transfer,
+        effective_range
     );
 
     if let Some(iso_val) = target_iso {
@@ -306,10 +341,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(ref y4m_out_path) = args.output_y4m {
         eprintln!(
-            "[*] Native Rust Motion-Compensated Denoiser (Strength: {:.2}x, Detail Protect: {:.2}x) -> {}",
-            args.denoise_strength, args.denoise_detail_protect, y4m_out_path.display()
+            "[*] Native Rust MCTF + Bilateral Denoiser (Strength: {:.2}x, Detail Protect: {:.2}x, Dither: {}) -> {}",
+            args.denoise_strength, args.denoise_detail_protect, args.dither, y4m_out_path.display()
         );
-        let mut y4m_writer = Y4mWriter::create(y4m_out_path, &stream.raw_header_line, stream.bit_depth)?;
+        let mut y4m_writer = Y4mWriter::create(y4m_out_path, &stream.raw_header_line, stream.bit_depth, args.dither)?;
 
         let provided_scenes = if let Some(ref sc_path) = args.scenes {
             Some(parse_av1an_scenes(sc_path)?)
@@ -319,9 +354,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut scene_detector = SceneDetector::new(12, 300);
         let mut ring: VecDeque<(usize, YuvFrame, usize)> = VecDeque::new();
+        let mut scene_bounds: HashMap<usize, (usize, usize)> = HashMap::new();
+        let mut scene_profiles: HashMap<usize, GrainProfile> = HashMap::new();
         let mut current_scene_id = 0usize;
-        let mut current_scene_start = 0usize;
-        let mut active_scene_prof: Option<GrainProfile> = None;
         let mut eof_reached = false;
         let mut next_frame_idx = 0usize;
 
@@ -340,10 +375,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 if is_cut {
+                    if let Some(bounds) = scene_bounds.get_mut(&current_scene_id) {
+                        bounds.1 = next_frame_idx;
+                    }
                     current_scene_id += 1;
                 }
 
-                if active_scene_prof.is_none() || is_cut {
+                scene_bounds
+                    .entry(current_scene_id)
+                    .and_modify(|b| b.1 = next_frame_idx + 1)
+                    .or_insert((next_frame_idx, next_frame_idx + 1));
+
+                if !scene_profiles.contains_key(&current_scene_id) {
                     let analysis_ctype = if is_tuning_active && args.force_bypass >= 1 {
                         ContentType::LiveAction
                     } else {
@@ -354,7 +397,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         fallback_analyze_frame(&frame.y, stream.width, stream.height)
                     };
-                    active_scene_prof = Some(smooth_profile(&mut lookahead_queue, prof, lookahead_window));
+                    scene_profiles.insert(current_scene_id, smooth_profile(&mut lookahead_queue, prof, lookahead_window));
                 }
 
                 ring.push_back((next_frame_idx, frame, current_scene_id));
@@ -373,7 +416,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let mut center_pos = 0usize;
-        let mut last_recorded_scene_id = usize::MAX;
 
         while center_pos < ring.len() {
             while ring.len() - center_pos <= 2 && !eof_reached {
@@ -385,26 +427,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     if is_cut {
-                        if let Some(ref prev_prof) = active_scene_prof {
-                            entries.push(build_entry_for_profile(
-                                current_scene_start,
-                                next_frame_idx,
-                                prev_prof,
-                                &args,
-                                content_type,
-                                digital_noise_mode,
-                                target_iso,
-                                effective_transfer,
-                                effective_tune_intensity,
-                                retention_scale,
-                                stream.width,
-                                stream.height,
-                            ));
-                            vs_telemetry.push(make_vs_telemetry(current_scene_start, next_frame_idx, prev_prof, args.denoise_strength));
+                        if let Some(bounds) = scene_bounds.get_mut(&current_scene_id) {
+                            bounds.1 = next_frame_idx;
                         }
                         current_scene_id += 1;
-                        current_scene_start = next_frame_idx;
-                        last_recorded_scene_id = current_scene_id - 1;
+                    }
+
+                    scene_bounds
+                        .entry(current_scene_id)
+                        .and_modify(|b| b.1 = next_frame_idx + 1)
+                        .or_insert((next_frame_idx, next_frame_idx + 1));
+
+                    if !scene_profiles.contains_key(&current_scene_id) {
+                        let prev_y = ring.back().filter(|r| r.2 == current_scene_id).map(|r| r.1.y.as_slice());
+                        let mf = prev_y.map(|p| estimate_motion_field(&frame.y, p, stream.width, stream.height, 16));
+                        let prof = if args.mutagen == MutagenState::On {
+                            mutagen_engine.analyze_frame(&frame.y, prev_y, mf.as_ref(), stream.width, stream.height, analysis_ctype)
+                        } else {
+                            fallback_analyze_frame(&frame.y, stream.width, stream.height)
+                        };
+                        scene_profiles.insert(current_scene_id, smooth_profile(&mut lookahead_queue, prof, lookahead_window));
                     }
 
                     ring.push_back((next_frame_idx, frame, current_scene_id));
@@ -415,21 +457,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let (c_idx, ref c_frame, c_sid) = ring[center_pos];
-            if c_sid != last_recorded_scene_id && (active_scene_prof.is_none() || c_idx == current_scene_start) {
-                let prev_y = if center_pos > 0 && ring[center_pos - 1].2 == c_sid {
-                    Some(ring[center_pos - 1].1.y.as_slice())
-                } else {
-                    None
-                };
-                let mf = prev_y.map(|p| estimate_motion_field(&c_frame.y, p, stream.width, stream.height, 16));
-                let prof = if args.mutagen == MutagenState::On {
-                    mutagen_engine.analyze_frame(&c_frame.y, prev_y, mf.as_ref(), stream.width, stream.height, analysis_ctype)
-                } else {
-                    fallback_analyze_frame(&c_frame.y, stream.width, stream.height)
-                };
-                active_scene_prof = Some(smooth_profile(&mut lookahead_queue, prof, lookahead_window));
-            }
-
             let get_same_scene = |offset: isize| -> Option<&YuvFrame> {
                 let pos = center_pos as isize + offset;
                 if pos >= 0 && (pos as usize) < ring.len() && ring[pos as usize].2 == c_sid {
@@ -447,7 +474,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 get_same_scene(2),
             ];
 
-            let prof_ref = active_scene_prof.as_ref().unwrap();
+            let prof_ref = &scene_profiles[&c_sid];
             let cleaned_frame = denoise_and_degrain_frame(
                 &neighbors,
                 prof_ref,
@@ -470,22 +497,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if let Some(ref prof) = active_scene_prof {
-            entries.push(build_entry_for_profile(
-                current_scene_start,
-                next_frame_idx.max(current_scene_start + 1),
-                prof,
-                &args,
-                content_type,
-                digital_noise_mode,
-                target_iso,
-                effective_transfer,
-                effective_tune_intensity,
-                retention_scale,
-                stream.width,
-                stream.height,
-            ));
-            vs_telemetry.push(make_vs_telemetry(current_scene_start, next_frame_idx.max(current_scene_start + 1), prof, args.denoise_strength));
+        for sid in 0..=current_scene_id {
+            if let (Some(&(s_f, e_f)), Some(prof)) = (scene_bounds.get(&sid), scene_profiles.get(&sid)) {
+                entries.push(build_entry_for_profile(
+                    s_f,
+                    e_f,
+                    prof,
+                    &args,
+                    content_type,
+                    digital_noise_mode,
+                    target_iso,
+                    effective_transfer,
+                    effective_range,
+                    effective_tune_intensity,
+                    retention_scale,
+                    stream.width,
+                    stream.height,
+                ));
+                vs_telemetry.push(make_vs_telemetry(s_f, e_f, prof, args.denoise_strength));
+            }
         }
 
         y4m_writer.flush()?;
@@ -519,11 +549,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             for (idx, seg) in segments.iter().enumerate() {
                 let mid_point = (seg.start_frame + seg.end_frame) / 2;
-
                 let target_prev = mid_point.saturating_sub(1);
                 if stream.current_frame < target_prev {
                     let to_skip = target_prev - stream.current_frame;
                     if !stream.skip_frames(to_skip) {
+                        let tail = stream.drain_stderr_tail();
+                        if !tail.trim().is_empty() {
+                            eprintln!("    [!] Stream ended early at frame {}. Process log:\n{}", stream.current_frame, tail.trim());
+                        }
                         break;
                     }
                 }
@@ -559,6 +592,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     digital_noise_mode,
                     target_iso,
                     effective_transfer,
+                    effective_range,
                     effective_tune_intensity,
                     retention_scale,
                     stream.width,
@@ -616,6 +650,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         digital_noise_mode,
                         target_iso,
                         effective_transfer,
+                        effective_range,
                         effective_tune_intensity,
                         retention_scale,
                         stream.width,
@@ -659,6 +694,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     digital_noise_mode,
                     target_iso,
                     effective_transfer,
+                    effective_range,
                     effective_tune_intensity,
                     retention_scale,
                     stream.width,
@@ -708,6 +744,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             digital_noise_mode,
             target_iso,
             effective_transfer,
+            effective_range,
             effective_tune_intensity,
             retention_scale,
             stream.width,
@@ -726,9 +763,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write_filmgrn1_table(&args.output, &entries, effective_time_unit, stream.fps_num, stream.fps_den)?;
     eprintln!("[✓] FGS table ({:?}) written to: {}", effective_time_unit, args.output.display());
 
-    if let Some(ref chunk_dir) = args.emit_chunk_tables {
-        write_av1an_chunk_tables(chunk_dir, &entries, args.time_unit, stream.fps_num, stream.fps_den)?;
-        eprintln!("[✓] Per-chunk t=0 tables written to: {}", chunk_dir.display());
+    if args.emit_chunk_tables.is_some() || args.emit_av1an_zones.is_some() {
+        let chunk_dir = args
+            .emit_chunk_tables
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("ct_av1an_zones_tbl"));
+
+        let zone_count = write_av1an_chunks_and_zones(
+            &chunk_dir,
+            args.emit_av1an_zones.as_deref(),
+            args.av1an_encoder,
+            &entries,
+            args.zone_merge_threshold,
+            stream.fps_num,
+            stream.fps_den,
+        )?;
+
+        eprintln!(
+            "[✓] Emitted {} merged t=0 zone tables into: {}",
+            zone_count,
+            chunk_dir.display()
+        );
+        if let Some(ref zp) = args.emit_av1an_zones {
+            eprintln!(
+                "[✓] Av1an zones file written to: {} (Pass via `av1an --zones {}` WITHOUT --fgs-table inside -v)",
+                zp.display(),
+                zp.display()
+            );
+        }
     }
 
     if let Some(ref events_path) = args.emit_fgs_events {

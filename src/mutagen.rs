@@ -1,5 +1,5 @@
 use crate::motion::sample_bilinear;
-use crate::types::{ContentType, GrainProfile, MotionField, TransferCurve};
+use crate::types::{ColorRange, ContentType, GrainProfile, MotionField, TransferCurve};
 use rayon::prelude::*;
 use std::cmp::Ordering;
 
@@ -27,9 +27,6 @@ impl MutagenEngine {
         }
     }
 
-    /// Analyzes frame noise using Scharr edge detection, 2D planar detrending,
-    /// Immerkaer 3x3 Laplacian MAD, 8x8 DCT blockiness, temporal motion-compensated
-    /// residual verification, NLM patch consensus, and clean-room Yule-Walker AR estimation.
     pub fn analyze_frame(
         &self,
         luma: &[f32],
@@ -52,212 +49,227 @@ impl MutagenEngine {
         let total_pixels = (width * height).max(1) as f32;
         let frame_mean_luma = luma.iter().sum::<f32>() / total_pixels;
 
-        let block_samples: Vec<BlockSample> = (0..blocks_y)
-            .into_par_iter()
-            .flat_map(|by| {
-                let mut local = Vec::new();
-                for bx in (0..blocks_x).step_by(2) {
-                    let y_start = by * block_size;
-                    let x_start = bx * block_size;
+        let block_results: (Vec<BlockSample>, Vec<f32>) = {
+            let raw: Vec<(Option<BlockSample>, f32)> = (0..blocks_y)
+                .into_par_iter()
+                .flat_map(|by| {
+                    let mut local = Vec::new();
+                    for bx in (0..blocks_x).step_by(2) {
+                        let y_start = by * block_size;
+                        let x_start = bx * block_size;
 
-                    // 1. Isotropic 3x3 Scharr edge detection + Immerkaer high-pass noise
-                    let mut scharr_acc = 0.0f32;
-                    let mut scharr_max = 0.0f32;
-                    let mut imm_abs = Vec::with_capacity(14 * 14);
+                        let mut scharr_acc = 0.0f32;
+                        let mut scharr_max = 0.0f32;
+                        let mut imm_abs = Vec::with_capacity(14 * 14);
 
-                    for y in 1..block_size - 1 {
-                        for x in 1..block_size - 1 {
-                            let row0 = (y_start + y - 1) * width + x_start;
-                            let row1 = (y_start + y) * width + x_start;
-                            let row2 = (y_start + y + 1) * width + x_start;
+                        for y in 1..block_size - 1 {
+                            for x in 1..block_size - 1 {
+                                let row0 = (y_start + y - 1) * width + x_start;
+                                let row1 = (y_start + y) * width + x_start;
+                                let row2 = (y_start + y + 1) * width + x_start;
 
-                            let p00 = luma[row0 + x - 1];
-                            let p01 = luma[row0 + x];
-                            let p02 = luma[row0 + x + 1];
-                            let p10 = luma[row1 + x - 1];
-                            let p11 = luma[row1 + x];
-                            let p12 = luma[row1 + x + 1];
-                            let p20 = luma[row2 + x - 1];
-                            let p21 = luma[row2 + x];
-                            let p22 = luma[row2 + x + 1];
+                                let p00 = luma[row0 + x - 1];
+                                let p01 = luma[row0 + x];
+                                let p02 = luma[row0 + x + 1];
+                                let p10 = luma[row1 + x - 1];
+                                let p11 = luma[row1 + x];
+                                let p12 = luma[row1 + x + 1];
+                                let p20 = luma[row2 + x - 1];
+                                let p21 = luma[row2 + x];
+                                let p22 = luma[row2 + x + 1];
 
-                            let gx = -3.0 * p00 + 3.0 * p02 - 10.0 * p10 + 10.0 * p12 - 3.0 * p20 + 3.0 * p22;
-                            let gy = -3.0 * p00 - 10.0 * p01 - 3.0 * p02 + 3.0 * p20 + 10.0 * p21 + 3.0 * p22;
-                            let mag = (gx.abs() + gy.abs()) / 32.0;
-                            scharr_acc += mag;
-                            if mag > scharr_max {
-                                scharr_max = mag;
-                            }
-
-                            let imm = (p00 - 2.0 * p01 + p02 - 2.0 * p10 + 4.0 * p11 - 2.0 * p12
-                                + p20 - 2.0 * p21 + p22)
-                                .abs();
-                            imm_abs.push(imm);
-                        }
-                    }
-
-                    let avg_scharr = scharr_acc / (14.0 * 14.0);
-                    if avg_scharr > max_edge || scharr_max > max_edge * 4.5 {
-                        continue;
-                    }
-
-                    imm_abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-                    let sigma_imm = (imm_abs[imm_abs.len() / 2] * 1.4826) / 6.0;
-
-                    // 2. Wang/Muijs 8x8 DCT grid blockiness ratio
-                    let mut bound_sum = 0.0f32;
-                    let mut inner_sum = 0.0f32;
-                    let mut inner_count = 0.0f32;
-
-                    for y in 0..block_size {
-                        let row = (y_start + y) * width + x_start;
-                        bound_sum += (luma[row + 7] - luma[row + 8]).abs();
-                        for x in 2..6 {
-                            inner_sum += (luma[row + x] - luma[row + x + 1]).abs();
-                            inner_count += 1.0;
-                        }
-                        for x in 10..14 {
-                            inner_sum += (luma[row + x] - luma[row + x + 1]).abs();
-                            inner_count += 1.0;
-                        }
-                    }
-                    for x in 0..block_size {
-                        bound_sum += (luma[(y_start + 7) * width + x_start + x]
-                            - luma[(y_start + 8) * width + x_start + x])
-                            .abs();
-                        for y in 2..6 {
-                            inner_sum += (luma[(y_start + y) * width + x_start + x]
-                                - luma[(y_start + y + 1) * width + x_start + x])
-                                .abs();
-                            inner_count += 1.0;
-                        }
-                        for y in 10..14 {
-                            inner_sum += (luma[(y_start + y) * width + x_start + x]
-                                - luma[(y_start + y + 1) * width + x_start + x])
-                                .abs();
-                            inner_count += 1.0;
-                        }
-                    }
-
-                    let blockiness = (bound_sum / 32.0) / (inner_sum / inner_count.max(1.0)).max(0.25);
-
-                    // 3. 2D planar linear-trend removal (isolates noise from lighting ramps)
-                    let mut sum = 0.0f32;
-                    let mut sum_x = 0.0f32;
-                    let mut sum_y = 0.0f32;
-
-                    for y in 0..block_size {
-                        let dy = (y as f32) - 7.5;
-                        let row = (y_start + y) * width + x_start;
-                        for x in 0..block_size {
-                            let p = luma[row + x];
-                            let dx = (x as f32) - 7.5;
-                            sum += p;
-                            sum_x += dx * p;
-                            sum_y += dy * p;
-                        }
-                    }
-
-                    let mean = sum / 256.0;
-                    let slope_x = sum_x / 5440.0;
-                    let slope_y = sum_y / 5440.0;
-
-                    let mut detrended = [0.0f32; 256];
-                    let mut abs_detrended = Vec::with_capacity(256);
-                    let mut sq_diff = 0.0f32;
-
-                    for y in 0..block_size {
-                        let dy = (y as f32) - 7.5;
-                        let row = (y_start + y) * width + x_start;
-                        for x in 0..block_size {
-                            let dx = (x as f32) - 7.5;
-                            let r = luma[row + x] - (mean + slope_x * dx + slope_y * dy);
-                            detrended[y * block_size + x] = r;
-                            abs_detrended.push(r.abs());
-                            sq_diff += r * r;
-                        }
-                    }
-
-                    abs_detrended.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-                    let sigma_detrend = abs_detrended[128] * 1.4826;
-
-                    // 4. Motion-compensated temporal residual check to reject static fine textures
-                    let mut sigma_eff = sigma_detrend;
-                    if let (Some(prev), Some(mf)) = (prev_luma, motion) {
-                        let mv_idx = by * mf.cols + bx;
-                        if mv_idx < mf.vectors.len() {
-                            let mv = mf.vectors[mv_idx];
-                            if mv.confidence > 0.65 {
-                                let mut temp_abs = Vec::with_capacity(256);
-                                for y in 0..block_size {
-                                    let cy = y_start + y;
-                                    let row = cy * width + x_start;
-                                    for x in 0..block_size {
-                                        let cx = x_start + x;
-                                        let pred = sample_bilinear(
-                                            prev,
-                                            width,
-                                            height,
-                                            (cx as f32) + mv.dx,
-                                            (cy as f32) + mv.dy,
-                                        );
-                                        temp_abs.push((luma[row + x] - pred).abs());
-                                    }
+                                let gx = -3.0 * p00 + 3.0 * p02 - 10.0 * p10 + 10.0 * p12 - 3.0 * p20 + 3.0 * p22;
+                                let gy = -3.0 * p00 - 10.0 * p01 - 3.0 * p02 + 3.0 * p20 + 10.0 * p21 + 3.0 * p22;
+                                let mag = (gx.abs() + gy.abs()) / 32.0;
+                                scharr_acc += mag;
+                                if mag > scharr_max {
+                                    scharr_max = mag;
                                 }
-                                temp_abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-                                // Independent temporal difference variance = 2 * sigma^2
-                                let sigma_temp = (temp_abs[128] * 1.4826) / std::f32::consts::SQRT_2;
-                                // If static deterministic texture dominates, cap spatial sigma by temporal variance
-                                sigma_eff = sigma_detrend.min(sigma_temp * 1.15);
+
+                                let imm = (p00 - 2.0 * p01 + p02 - 2.0 * p10 + 4.0 * p11 - 2.0 * p12
+                                    + p20 - 2.0 * p21 + p22)
+                                    .abs();
+                                imm_abs.push(imm);
                             }
                         }
-                    }
 
-                    // 5. 2D spatial autocorrelation
-                    let mut autocorr_acc = 0.0f32;
-                    for y in 0..block_size {
+                        let avg_scharr = scharr_acc / (14.0 * 14.0);
+                        if avg_scharr > max_edge || scharr_max > max_edge * 4.5 {
+                            local.push((None, avg_scharr));
+                            continue;
+                        }
+
+                        imm_abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+                        let sigma_imm = (imm_abs[imm_abs.len() / 2] * 1.4826) / 6.0;
+
+                        let mut bound_sum = 0.0f32;
+                        let mut inner_sum = 0.0f32;
+                        let mut inner_count = 0.0f32;
+
+                        for y in 0..block_size {
+                            let row = (y_start + y) * width + x_start;
+                            bound_sum += (luma[row + 7] - luma[row + 8]).abs();
+                            for x in 2..6 {
+                                inner_sum += (luma[row + x] - luma[row + x + 1]).abs();
+                                inner_count += 1.0;
+                            }
+                            for x in 10..14 {
+                                inner_sum += (luma[row + x] - luma[row + x + 1]).abs();
+                                inner_count += 1.0;
+                            }
+                        }
                         for x in 0..block_size {
-                            let r = detrended[y * block_size + x];
-                            if x + 1 < block_size {
-                                autocorr_acc += r * detrended[y * block_size + x + 1];
+                            bound_sum += (luma[(y_start + 7) * width + x_start + x]
+                                - luma[(y_start + 8) * width + x_start + x])
+                                .abs();
+                            for y in 2..6 {
+                                inner_sum += (luma[(y_start + y) * width + x_start + x]
+                                    - luma[(y_start + y + 1) * width + x_start + x])
+                                    .abs();
+                                inner_count += 1.0;
                             }
-                            if y + 1 < block_size {
-                                autocorr_acc += r * detrended[(y + 1) * block_size + x];
+                            for y in 10..14 {
+                                inner_sum += (luma[(y_start + y) * width + x_start + x]
+                                    - luma[(y_start + y + 1) * width + x_start + x])
+                                    .abs();
+                                inner_count += 1.0;
                             }
                         }
+
+                        let blockiness = (bound_sum / 32.0) / (inner_sum / inner_count.max(1.0)).max(0.25);
+
+                        let mut sum = 0.0f32;
+                        let mut sum_x = 0.0f32;
+                        let mut sum_y = 0.0f32;
+
+                        for y in 0..block_size {
+                            let dy = (y as f32) - 7.5;
+                            let row = (y_start + y) * width + x_start;
+                            for x in 0..block_size {
+                                let p = luma[row + x];
+                                let dx = (x as f32) - 7.5;
+                                sum += p;
+                                sum_x += dx * p;
+                                sum_y += dy * p;
+                            }
+                        }
+
+                        let mean = sum / 256.0;
+                        let slope_x = sum_x / 5440.0;
+                        let slope_y = sum_y / 5440.0;
+
+                        let mut detrended = [0.0f32; 256];
+                        let mut abs_detrended = Vec::with_capacity(256);
+                        let mut sq_diff = 0.0f32;
+
+                        for y in 0..block_size {
+                            let dy = (y as f32) - 7.5;
+                            let row = (y_start + y) * width + x_start;
+                            for x in 0..block_size {
+                                let dx = (x as f32) - 7.5;
+                                let r = luma[row + x] - (mean + slope_x * dx + slope_y * dy);
+                                detrended[y * block_size + x] = r;
+                                abs_detrended.push(r.abs());
+                                sq_diff += r * r;
+                            }
+                        }
+
+                        abs_detrended.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+                        let sigma_detrend = abs_detrended[128] * 1.4826;
+
+                        let mut sigma_eff = sigma_detrend;
+                        if let (Some(prev), Some(mf)) = (prev_luma, motion) {
+                            let mv_idx = by * mf.cols + bx;
+                            if mv_idx < mf.vectors.len() {
+                                let mv = mf.vectors[mv_idx];
+                                if mv.confidence > 0.65 {
+                                    let mut temp_abs = Vec::with_capacity(256);
+                                    for y in 0..block_size {
+                                        let cy = y_start + y;
+                                        let row = cy * width + x_start;
+                                        for x in 0..block_size {
+                                            let cx = x_start + x;
+                                            let pred = sample_bilinear(
+                                                prev,
+                                                width,
+                                                height,
+                                                (cx as f32) + mv.dx,
+                                                (cy as f32) + mv.dy,
+                                            );
+                                            temp_abs.push((luma[row + x] - pred).abs());
+                                        }
+                                    }
+                                    temp_abs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+                                    let sigma_temp = (temp_abs[128] * 1.4826) / std::f32::consts::SQRT_2;
+                                    sigma_eff = sigma_detrend.min(sigma_temp * 1.15);
+                                }
+                            }
+                        }
+
+                        let mut autocorr_acc = 0.0f32;
+                        for y in 0..block_size {
+                            for x in 0..block_size {
+                                let r = detrended[y * block_size + x];
+                                if x + 1 < block_size {
+                                    autocorr_acc += r * detrended[y * block_size + x + 1];
+                                }
+                                if y + 1 < block_size {
+                                    autocorr_acc += r * detrended[(y + 1) * block_size + x];
+                                }
+                            }
+                        }
+
+                        let rho = if sq_diff > 1.0 {
+                            (autocorr_acc / (2.0 * sq_diff)).clamp(-0.5, 0.99)
+                        } else {
+                            0.0
+                        };
+
+                        let nearest_bin = BIN_CENTERS
+                            .iter()
+                            .min_by_key(|&&c| ((c as f32) - mean).abs() as i32)
+                            .copied()
+                            .unwrap_or(128);
+
+                        local.push((
+                            Some(BlockSample {
+                                bin_center: nearest_bin,
+                                sigma_eff,
+                                sigma_imm,
+                                blockiness,
+                                rho,
+                                detrended,
+                            }),
+                            avg_scharr,
+                        ));
                     }
+                    local
+                })
+                .collect();
 
-                    let rho = if sq_diff > 1.0 {
-                        (autocorr_acc / (2.0 * sq_diff)).clamp(-0.5, 0.99)
-                    } else {
-                        0.0
-                    };
-
-                    let nearest_bin = BIN_CENTERS
-                        .iter()
-                        .min_by_key(|&&c| ((c as f32) - mean).abs() as i32)
-                        .copied()
-                        .unwrap_or(128);
-
-                    local.push(BlockSample {
-                        bin_center: nearest_bin,
-                        sigma_eff,
-                        sigma_imm,
-                        blockiness,
-                        rho,
-                        detrended,
-                    });
+            let mut samples = Vec::new();
+            let mut textures = Vec::new();
+            for (opt_s, scharr) in raw {
+                textures.push(scharr);
+                if let Some(s) = opt_s {
+                    samples.push(s);
                 }
-                local
-            })
-            .collect();
+            }
+            (samples, textures)
+        };
+
+        let texture_complexity = if !block_results.1.is_empty() {
+            block_results.1.iter().sum::<f32>() / (block_results.1.len() as f32)
+        } else {
+            1.0
+        };
 
         let mut bin_samples: [Vec<&BlockSample>; 8] = Default::default();
         let mut all_blockiness = Vec::new();
         let mut all_unwanted = Vec::new();
         let mut ar_valid_blocks: Vec<&[f32; 256]> = Vec::new();
 
-        for s in &block_samples {
+        for s in &block_results.0 {
             all_blockiness.push(s.blockiness);
             let hf_ratio = s.sigma_imm / s.sigma_eff.max(0.05);
             let is_blocky = s.blockiness > 1.75;
@@ -297,7 +309,6 @@ impl MutagenEngine {
             eff_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
             let med_eff = eff_vals[eff_vals.len() / 2];
 
-            // NLM patch-similarity consensus
             let h_param = (med_eff * 0.5).max(0.5);
             let mut w_sum = 0.0f32;
             let mut val_sum = 0.0f32;
@@ -381,7 +392,6 @@ impl MutagenEngine {
             1.0
         };
 
-        // Solve Yule-Walker AR coefficients directly from empirical detrended noise blocks
         let ar_coeffs_y = if lag == 0 {
             vec![]
         } else if ar_valid_blocks.len() >= 6 && authentic_grain_sigma >= 1.15 {
@@ -398,11 +408,12 @@ impl MutagenEngine {
             unwanted_noise_sigma,
             blockiness: avg_blockiness,
             mean_luma: frame_mean_luma,
+            texture_complexity,
+            hf_ratio: avg_hf_ratio,
         }
     }
 }
 
-/// Returns curated 70mm celluloid AR filter coefficients for a given lag.
 pub fn default_70mm_ar_coeffs(lag: u8) -> Vec<i32> {
     match lag {
         3 => vec![2, 1, -1, -3, 1, 4, 6, 4, 1, -2, 2, 8, 14, 8, 2, -2, 1, 4, 6, 4, 1, -3, -1, 1],
@@ -412,8 +423,6 @@ pub fn default_70mm_ar_coeffs(lag: u8) -> Vec<i32> {
     }
 }
 
-/// Classical 1927 Yule-Walker Toeplitz normal equation solver (Cholesky factorization)
-/// over the causal AV1 neighborhood of lag L (patent-unencumbered public-domain math).
 pub fn solve_ar_yule_walker(blocks: &[&[f32; 256]], lag: u8) -> Vec<i32> {
     let l = lag as isize;
     let mut offsets: Vec<(isize, isize)> = Vec::new();
@@ -431,7 +440,6 @@ pub fn solve_ar_yule_walker(blocks: &[&[f32; 256]], lag: u8) -> Vec<i32> {
         return vec![];
     }
 
-    // Compute empirical autocovariance table gamma(dx, dy) for dx, dy in [-2L ..= 2L]
     let max_shift = (2 * l) as usize;
     let span = 2 * max_shift + 1;
     let mut cov_sum = vec![0.0f64; span * span];
@@ -471,7 +479,6 @@ pub fn solve_ar_yule_walker(blocks: &[&[f32; 256]], lag: u8) -> Vec<i32> {
 
     let var0 = gamma(0, 0).max(1e-6);
 
-    // Build symmetric positive-definite Toeplitz matrix R and target vector r
     let mut mat_r = vec![0.0f64; n * n];
     let mut vec_r = vec![0.0f64; n];
 
@@ -482,11 +489,9 @@ pub fn solve_ar_yule_walker(blocks: &[&[f32; 256]], lag: u8) -> Vec<i32> {
             let (xj, yj) = offsets[j];
             mat_r[i * n + j] = gamma(xi - xj, yi - yj);
         }
-        // Ridge regularization guarantees strict positive definiteness
         mat_r[i * n + i] += 0.025 * var0;
     }
 
-    // Cholesky decomposition: mat_r = L * L^T
     let mut chol = vec![0.0f64; n * n];
     for i in 0..n {
         for j in 0..=i {
@@ -505,7 +510,6 @@ pub fn solve_ar_yule_walker(blocks: &[&[f32; 256]], lag: u8) -> Vec<i32> {
         }
     }
 
-    // Forward substitution: L * y = vec_r
     let mut y = vec![0.0f64; n];
     for i in 0..n {
         let mut sum = vec_r[i];
@@ -515,7 +519,6 @@ pub fn solve_ar_yule_walker(blocks: &[&[f32; 256]], lag: u8) -> Vec<i32> {
         y[i] = sum / chol[i * n + i];
     }
 
-    // Backward substitution: L^T * a = y
     let mut a = vec![0.0f64; n];
     for i in (0..n).rev() {
         let mut sum = y[i];
@@ -525,17 +528,14 @@ pub fn solve_ar_yule_walker(blocks: &[&[f32; 256]], lag: u8) -> Vec<i32> {
         a[i] = sum / chol[i * n + i];
     }
 
-    // Enforce AR stability (L1 norm <= 0.85) to prevent recursive blow-up at decoder
     let l1_norm: f64 = a.iter().map(|v| v.abs()).sum();
     let damp = if l1_norm > 0.85 { 0.85 / l1_norm } else { 1.0 };
 
-    // Quantize with ar_coeff_shift = 6 (multiplier 64.0)
     a.into_iter()
         .map(|v| (v * damp * 64.0).round().clamp(-128.0, 127.0) as i32)
         .collect()
 }
 
-/// Fast fallback analyzer when Mutagen is disabled.
 pub fn fallback_analyze_frame(luma: &[f32], width: usize, height: usize) -> GrainProfile {
     let block_size = 16;
     let blocks_x = width / block_size;
@@ -582,12 +582,11 @@ pub fn fallback_analyze_frame(luma: &[f32], width: usize, height: usize) -> Grai
         unwanted_noise_sigma: avg_sigma * 0.5,
         blockiness: 1.0,
         mean_luma: frame_mean_luma,
+        texture_complexity: 1.5,
+        hf_ratio: 0.60,
     }
 }
 
-/// Classifies content type while ignoring clipped dark shadows (<=24) and
-/// blown-out specular highlights (>=232), measuring consecutive identical pixel runs
-/// to distinguish true flat 2D cel fills and 3D CGI shading from smooth Live Action gradients.
 pub fn classify_frame_auto(luma: &[f32], width: usize, height: usize) -> ContentType {
     let block_size = 16;
     let blocks_x = width / block_size;
@@ -686,16 +685,25 @@ pub fn eotf_to_linear(v: f32, transfer: TransferCurve) -> f32 {
     }
 }
 
-/// Generates an ISO-calibrated photon-shot curve (matching Av1an --photon-noise)
-/// with clean 70mm spatial correlation or pure digital sensor noise.
 pub fn generate_iso_photon_profile(
     iso: u32,
     width: usize,
     height: usize,
     transfer: TransferCurve,
+    color_range: ColorRange,
     pure_digital: bool,
 ) -> (u8, Vec<i32>, Vec<(u8, u8)>) {
-    let luma_pts: [u8; 14] = [16, 19, 38, 58, 77, 96, 116, 135, 155, 174, 193, 213, 232, 235];
+    let luma_pts: [u8; 14] = if color_range == ColorRange::Full {
+        [0, 12, 32, 54, 76, 98, 120, 142, 164, 186, 208, 230, 250, 255]
+    } else {
+        [16, 19, 38, 58, 77, 96, 116, 135, 155, 174, 193, 213, 232, 235]
+    };
+
+    let (min_l, max_l) = if color_range == ColorRange::Full {
+        (0.0f32, 255.0f32)
+    } else {
+        (16.0f32, 235.0f32)
+    };
 
     let iso_scale = ((iso as f32) / 200.0).sqrt();
     let res_scale = ((1920.0 * 1080.0) / ((width * height).max(1) as f32))
@@ -703,15 +711,15 @@ pub fn generate_iso_photon_profile(
         .clamp(0.80, 1.30);
 
     let mut sy_points = Vec::with_capacity(14);
-    for &luma in &luma_pts {
-        if luma <= 16 || luma >= 235 {
+    for (idx, &luma) in luma_pts.iter().enumerate() {
+        if idx == 0 || idx == luma_pts.len() - 1 {
             sy_points.push((luma, 1));
             continue;
         }
 
-        let norm_v = ((luma as f32) - 16.0) / (235.0 - 16.0);
+        let norm_v = (((luma as f32) - min_l) / (max_l - min_l)).clamp(0.0, 1.0);
         let lin_light = eotf_to_linear(norm_v, transfer);
-        let toe_boost = if luma <= 24 { 0.85 } else { 0.0 };
+        let toe_boost = if norm_v <= 0.04 { 0.85 } else { 0.0 };
 
         let shot_curve = match transfer {
             TransferCurve::Pq => 1.8 + 1.6 * lin_light.clamp(0.0, 2.5).powf(0.35),
@@ -736,7 +744,11 @@ pub fn generate_iso_photon_profile(
     (lag, default_70mm_ar_coeffs(lag), sy_points)
 }
 
-pub fn get_subtle_70mm_profile(ctype: ContentType, scene_mean_luma: f32) -> (u8, Vec<i32>, Vec<(u8, u8)>) {
+pub fn get_subtle_70mm_profile(
+    ctype: ContentType,
+    scene_mean_luma: f32,
+    color_range: ColorRange,
+) -> (u8, Vec<i32>, Vec<(u8, u8)>) {
     let lag = match ctype {
         ContentType::TwoD => 2,
         ContentType::ThreeD => 2,
@@ -745,7 +757,7 @@ pub fn get_subtle_70mm_profile(ctype: ContentType, scene_mean_luma: f32) -> (u8,
 
     let luma_weight = (scene_mean_luma / 128.0).clamp(0.6, 1.4);
 
-    let raw_sy: Vec<(u8, u8)> = match ctype {
+    let mut raw_sy: Vec<(u8, u8)> = match ctype {
         ContentType::TwoD => {
             vec![
                 (16, 1),
@@ -789,6 +801,12 @@ pub fn get_subtle_70mm_profile(ctype: ContentType, scene_mean_luma: f32) -> (u8,
             ]
         }
     };
+
+    if color_range == ColorRange::Full {
+        raw_sy[0].0 = 0;
+        let last = raw_sy.len() - 1;
+        raw_sy[last].0 = 255;
+    }
 
     let cleaned_sy = raw_sy.into_iter().map(|(l, v)| (l, v.clamp(1, 255))).collect();
     (lag, default_70mm_ar_coeffs(lag), cleaned_sy)

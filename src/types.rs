@@ -31,6 +31,16 @@ pub enum TransferCurve {
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq)]
+pub enum ColorRange {
+    #[value(name = "auto")]
+    Auto,
+    #[value(name = "limited")]
+    Limited,
+    #[value(name = "full")]
+    Full,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq)]
 pub enum FgsBalanceMode {
     #[value(name = "complement")]
     Complement,
@@ -50,8 +60,19 @@ pub enum TimeUnitMode {
     Global,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq)]
+pub enum Av1anEncoder {
+    #[value(name = "svt-av1")]
+    SvtAv1,
+    #[value(name = "aom")]
+    Aom,
+    #[value(name = "rav1e")]
+    Rav1e,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ChromaSubsampling {
+    Gray,
     Yuv420,
     Yuv422,
     Yuv444,
@@ -96,6 +117,7 @@ pub struct MotionField {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct GrainProfile {
     pub lag: u8,
     pub ar_coeffs_y: Vec<i32>,
@@ -104,6 +126,8 @@ pub struct GrainProfile {
     pub unwanted_noise_sigma: f32,
     pub blockiness: f32,
     pub mean_luma: f32,
+    pub texture_complexity: f32,
+    pub hf_ratio: f32,
 }
 
 #[derive(Clone, Debug)]

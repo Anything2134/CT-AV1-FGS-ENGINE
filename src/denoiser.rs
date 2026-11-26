@@ -43,14 +43,17 @@ fn compute_detail_protection_mask(
     width: usize,
     height: usize,
     detail_protect: f32,
+    texture_complexity: f32,
 ) -> Vec<f32> {
     let mut mask = vec![0.0f32; width * height];
     if width < 3 || height < 3 || detail_protect <= 0.0 {
         return mask;
     }
 
-    let edge_floor = (5.0 / detail_protect.max(0.1)).clamp(1.5, 15.0);
-    let edge_span = (8.0 / detail_protect.max(0.1)).clamp(3.0, 20.0);
+    // Automatically tighten protection slightly when texture complexity is rich
+    let auto_protect = detail_protect * (1.0 + (texture_complexity - 1.5).max(0.0) * 0.15);
+    let edge_floor = (5.0 / auto_protect.max(0.1)).clamp(1.5, 15.0);
+    let edge_span = (8.0 / auto_protect.max(0.1)).clamp(3.0, 20.0);
 
     mask.par_chunks_mut(width).enumerate().for_each(|(y, row_out)| {
         if y == 0 || y == height - 1 {
@@ -81,8 +84,79 @@ fn compute_detail_protection_mask(
     mask
 }
 
-/// Native Rust Motion-Compensated Temporal Filter (MCTF) and Auto-Degrainer.
-/// Integrates ergonomic user strength & detail protection controls on top of Mutagen auto-tuning.
+/// Adaptive 5x5 spatial bilateral + selective 8x8 DCT boundary deblocking pass.
+/// Eliminates frozen spatial mosquito noise on duplicated anime frames (2s/3s) and macroblocks
+/// while strictly leaving edges and fine mid-frequency details intact.
+fn spatial_adaptive_bilateral_deblock(
+    plane: &[f32],
+    edge_mask: Option<&[f32]>,
+    width: usize,
+    height: usize,
+    profile: &GrainProfile,
+    denoise_strength: f32,
+    retain_weight: f32,
+) -> Vec<f32> {
+    let mut out = plane.to_vec();
+    if width < 5 || height < 5 || denoise_strength <= 0.001 {
+        return out;
+    }
+
+    let base_sigma = (profile.unwanted_noise_sigma * 1.45 * denoise_strength).clamp(0.4, 5.5);
+    let is_blocky_scene = profile.blockiness > 1.50;
+    let inv_2s2 = 1.0 / (2.0 * base_sigma * base_sigma);
+    let blend_cap = (1.0 - retain_weight * 0.65).clamp(0.25, 1.0);
+
+    out.par_chunks_mut(width).enumerate().for_each(|(y, row_out)| {
+        if y < 2 || y >= height - 2 {
+            return;
+        }
+        let row_off = y * width;
+        let on_y_bound = is_blocky_scene && (y % 8 == 0 || y % 8 == 7);
+
+        for x in 2..width - 2 {
+            let em = edge_mask.map(|m| m[row_off + x]).unwrap_or(0.0);
+            if em > 0.85 {
+                continue;
+            }
+
+            let center = plane[row_off + x];
+            let on_x_bound = is_blocky_scene && (x % 8 == 0 || x % 8 == 7);
+            let local_inv = if on_x_bound || on_y_bound {
+                inv_2s2 * 0.45
+            } else {
+                inv_2s2
+            };
+
+            let mut w_sum = 1.0f32;
+            let mut acc = center;
+
+            for dy in -2isize..=2 {
+                let ny = (y as isize + dy) as usize;
+                let nrow = ny * width;
+                for dx in -2isize..=2 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nx = (x as isize + dx) as usize;
+                    let sample = plane[nrow + nx];
+                    let diff = sample - center;
+                    let spatial_w = if dx.abs() <= 1 && dy.abs() <= 1 { 0.85 } else { 0.35 };
+                    let w = spatial_w * (-(diff * diff) * local_inv).exp();
+                    w_sum += w;
+                    acc += w * sample;
+                }
+            }
+
+            let filtered = acc / w_sum;
+            let alpha = (1.0 - em) * blend_cap;
+            row_out[x] = center * (1.0 - alpha) + filtered * alpha;
+        }
+    });
+
+    out
+}
+
+/// Native Rust Motion-Compensated Temporal Filter (MCTF) + Spatial Bilateral Deblocker.
 pub fn denoise_and_degrain_frame(
     neighbors: &[Option<&YuvFrame>; 5],
     profile: &GrainProfile,
@@ -125,12 +199,17 @@ pub fn denoise_and_degrain_frame(
         .collect();
 
     let edge_mask = if protect_lines && detail_protect > 0.0 {
-        Some(compute_detail_protection_mask(&y_spatial, w, h, detail_protect))
+        Some(compute_detail_protection_mask(
+            &y_spatial,
+            w,
+            h,
+            detail_protect,
+            profile.texture_complexity,
+        ))
     } else {
         None
     };
 
-    // Scale thresholds by user-configurable --denoise-strength (1.0 = full automatic)
     let strength = denoise_strength.clamp(0.05, 3.0);
     let h_noise = ((profile.unwanted_noise_sigma * 2.4 + (profile.blockiness - 1.0).max(0.0) * 1.8)
         * strength)
@@ -142,10 +221,10 @@ pub fn denoise_and_degrain_frame(
     let inv_2h_total = 1.0 / (2.0 * h_total * h_total);
     let retain_weight = (grain_retain_pct / 100.0).clamp(0.0, 1.0);
 
-    let mut y_out = vec![0.0f32; w * h];
+    let mut y_mctf = vec![0.0f32; w * h];
     let neighbor_slots = [0usize, 1, 3, 4];
 
-    y_out.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
+    y_mctf.par_chunks_mut(w).enumerate().for_each(|(y, row_out)| {
         let by = (y / bs).min((h / bs).saturating_sub(1));
         let row_off = y * w;
 
@@ -165,7 +244,25 @@ pub fn denoise_and_degrain_frame(
                     if mv_idx < mf.vectors.len() {
                         let mv = mf.vectors[mv_idx];
                         if mv.confidence > 0.15 {
-                            let sample = sample_bilinear(&ref_frame.y, w, h, (x as f32) + mv.dx, (y as f32) + mv.dy);
+                            let fx = (x as f32) + mv.dx;
+                            let fy = (y as f32) + mv.dy;
+                            let sample = sample_bilinear(&ref_frame.y, w, h, fx, fy);
+
+                            // Per-pixel occlusion guard: check horizontal neighbor consistency to prevent limb ghosting
+                            let patch_guard = if x > 0 && x + 1 < w {
+                                let sl = sample_bilinear(&ref_frame.y, w, h, fx - 1.0, fy);
+                                let sr = sample_bilinear(&ref_frame.y, w, h, fx + 1.0, fy);
+                                ((sl - y_spatial[row_off + x - 1]).abs()
+                                    + (sr - y_spatial[row_off + x + 1]).abs())
+                                    * 0.5
+                            } else {
+                                0.0
+                            };
+
+                            if patch_guard > h_total * 2.4 {
+                                continue;
+                            }
+
                             let diff = sample - c_val;
                             let d2 = diff * diff;
                             let temp_decay = if slot == 0 || slot == 4 { 0.70 } else { 1.0 };
@@ -195,9 +292,39 @@ pub fn denoise_and_degrain_frame(
         }
     });
 
+    // Stage 2: Spatial adaptive bilateral & selective 8x8 DCT deblocking for frozen compression noise
+    let y_out = if profile.unwanted_noise_sigma > 0.25 || profile.blockiness > 1.50 {
+        spatial_adaptive_bilateral_deblock(
+            &y_mctf,
+            edge_mask.as_deref(),
+            w,
+            h,
+            profile,
+            strength,
+            retain_weight,
+        )
+    } else {
+        y_mctf
+    };
+
+    if curr.subsampling == ChromaSubsampling::Gray || curr.chroma_width == 0 || curr.chroma_height == 0 {
+        return YuvFrame {
+            width: w,
+            height: h,
+            chroma_width: 0,
+            chroma_height: 0,
+            bit_depth: curr.bit_depth,
+            subsampling: curr.subsampling,
+            y: y_out,
+            u: Vec::new(),
+            v: Vec::new(),
+        };
+    }
+
     let cw = curr.chroma_width;
     let ch = curr.chroma_height;
     let (scale_x, scale_y) = match curr.subsampling {
+        ChromaSubsampling::Gray => (0.0f32, 0.0f32),
         ChromaSubsampling::Yuv420 => (0.5f32, 0.5f32),
         ChromaSubsampling::Yuv422 => (0.5f32, 1.0f32),
         ChromaSubsampling::Yuv444 => (1.0f32, 1.0f32),

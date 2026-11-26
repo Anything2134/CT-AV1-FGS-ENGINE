@@ -1,5 +1,5 @@
 use crate::mutagen::default_70mm_ar_coeffs;
-use crate::types::{FgsBalanceMode, FgsTableEntry, TimeUnitMode, VsSceneTelemetry};
+use crate::types::{Av1anEncoder, FgsBalanceMode, FgsTableEntry, TimeUnitMode, VsSceneTelemetry};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -11,7 +11,6 @@ pub fn rand_seed(salt: usize) -> u16 {
     ((x ^ (x >> 31)) % 64000 + 1000) as u16
 }
 
-/// Converts a frame index to SVT-AV1 4.3.0+ 100-nanosecond ticks using exact Y4M framerate.
 pub fn frame_to_100ns(frame: usize, fps_num: u64, fps_den: u64) -> u64 {
     let num = (frame as u128) * 10_000_000u128 * (fps_den as u128);
     let den = fps_num.max(1) as u128;
@@ -27,7 +26,95 @@ pub fn compute_fgs_retention_scale(grain_retain_pct: f32, balance_mode: FgsBalan
     }
 }
 
-/// Writes a complete filmgrn1 table using the requested timestamp mode (100ns, frames, or global).
+/// Computes a duration-weighted global FGS entry across all analyzed scenes so
+/// global-mode tables accurately represent the entire feature rather than Scene 0 alone.
+fn aggregate_global_entry(entries: &[FgsTableEntry]) -> FgsTableEntry {
+    if entries.len() == 1 {
+        return entries[0].clone();
+    }
+
+    let mut total_weight = 0.0f64;
+    let mut lag_votes = [0.0f64; 4];
+
+    for e in entries {
+        let dur = e.end_frame.saturating_sub(e.start_frame).max(1) as f64;
+        let avg_v: f64 = e.points_sy.iter().map(|&(_, v)| v as f64).sum::<f64>()
+            / (e.points_sy.len().max(1) as f64);
+        // Down-weight pure black fade/logo scenes when richer scenes exist
+        let w = if avg_v <= 1.1 { dur * 0.1 } else { dur };
+        total_weight += w;
+        let l = (e.lag as usize).min(3);
+        lag_votes[l] += w;
+    }
+
+    let dominant_lag = lag_votes
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u8)
+        .unwrap_or(2);
+
+    let ref_entry = entries
+        .iter()
+        .find(|e| e.lag == dominant_lag)
+        .unwrap_or(&entries[0]);
+
+    let num_pts = ref_entry.points_sy.len();
+    let mut agg_pts = Vec::with_capacity(num_pts);
+    for pi in 0..num_pts {
+        let luma = ref_entry.points_sy[pi].0;
+        let mut acc_v = 0.0f64;
+        let mut w_acc = 0.0f64;
+        for e in entries {
+            if e.points_sy.len() == num_pts {
+                let dur = e.end_frame.saturating_sub(e.start_frame).max(1) as f64;
+                let avg_v: f64 = e.points_sy.iter().map(|&(_, v)| v as f64).sum::<f64>()
+                    / (e.points_sy.len().max(1) as f64);
+                let w = if avg_v <= 1.1 { dur * 0.1 } else { dur };
+                acc_v += w * ((e.points_sy[pi].1 as f64) * (e.scale as f64));
+                w_acc += w;
+            }
+        }
+        let v = if w_acc > 0.0 {
+            (acc_v / w_acc).round().clamp(1.0, 255.0) as u8
+        } else {
+            ref_entry.points_sy[pi].1
+        };
+        agg_pts.push((luma, v));
+    }
+
+    let ar_len = 2 * (dominant_lag as usize) * ((dominant_lag as usize) + 1);
+    let mut agg_ar = vec![0.0f64; ar_len];
+    let mut ar_w = 0.0f64;
+
+    for e in entries {
+        if e.lag == dominant_lag && e.ar_coeffs_y.len() == ar_len {
+            let dur = e.end_frame.saturating_sub(e.start_frame).max(1) as f64;
+            for (k, &c) in e.ar_coeffs_y.iter().enumerate() {
+                agg_ar[k] += dur * (c as f64);
+            }
+            ar_w += dur;
+        }
+    }
+
+    let final_ar: Vec<i32> = if ar_w > 0.0 {
+        agg_ar.into_iter().map(|v| (v / ar_w).round().clamp(-128.0, 127.0) as i32).collect()
+    } else {
+        default_70mm_ar_coeffs(dominant_lag)
+    };
+
+    let _ = total_weight;
+    FgsTableEntry {
+        start_frame: 0,
+        end_frame: usize::MAX,
+        lag: dominant_lag,
+        ar_coeffs_y: final_ar,
+        points_sy: agg_pts,
+        scale: 1.0,
+        seed: entries[0].seed,
+    }
+}
+
 pub fn write_filmgrn1_table(
     path: &Path,
     entries: &[FgsTableEntry],
@@ -39,8 +126,8 @@ pub fn write_filmgrn1_table(
     writeln!(out, "filmgrn1")?;
 
     if time_unit == TimeUnitMode::Global && !entries.is_empty() {
-        let e = &entries[0];
-        write_single_entry(&mut out, 0, u64::MAX, e)?;
+        let agg = aggregate_global_entry(entries);
+        write_single_entry(&mut out, 0, u64::MAX, &agg)?;
         return Ok(());
     }
 
@@ -69,28 +156,91 @@ pub fn write_filmgrn1_table(
     Ok(())
 }
 
-/// Emits individual chunk tables shifted to start at t = 0 for Av1an multi-worker encoding.
-pub fn write_av1an_chunk_tables(
-    dir: &Path,
+/// Clusters consecutive entries with similar grain characteristics to prevent redundant mini-chunks
+/// in Av1an, writes t=0 chunk tables, and optionally emits a ready-to-use Av1an zones file.
+pub fn write_av1an_chunks_and_zones(
+    chunk_dir: &Path,
+    zones_path: Option<&Path>,
+    encoder: Av1anEncoder,
     entries: &[FgsTableEntry],
-    time_unit: TimeUnitMode,
+    merge_threshold: f32,
     fps_num: u64,
     fps_den: u64,
-) -> std::io::Result<()> {
-    fs::create_dir_all(dir)?;
-    for (idx, e) in entries.iter().enumerate() {
-        let chunk_path = dir.join(format!("chunk_{:05}.tbl", idx));
-        let mut out = File::create(&chunk_path)?;
+) -> std::io::Result<usize> {
+    fs::create_dir_all(chunk_dir)?;
+    let abs_dir = fs::canonicalize(chunk_dir).unwrap_or_else(|_| chunk_dir.to_path_buf());
+
+    // Merge consecutive scenes whose lag matches and mean scaled sY delta <= merge_threshold
+    let mut merged: Vec<FgsTableEntry> = Vec::new();
+    for e in entries {
+        if let Some(last) = merged.last_mut() {
+            if last.lag == e.lag && last.points_sy.len() == e.points_sy.len() {
+                let mean_delta: f32 = last
+                    .points_sy
+                    .iter()
+                    .zip(e.points_sy.iter())
+                    .map(|((_, a), (_, b))| {
+                        ((*a as f32) * last.scale - (*b as f32) * e.scale).abs()
+                    })
+                    .sum::<f32>()
+                    / (last.points_sy.len().max(1) as f32);
+
+                if mean_delta <= merge_threshold {
+                    last.end_frame = e.end_frame;
+                    continue;
+                }
+            }
+        }
+        merged.push(e.clone());
+    }
+
+    let mut zones_file = if let Some(zp) = zones_path {
+        Some(File::create(zp)?)
+    } else {
+        None
+    };
+
+    let (enc_name, flag_fmt) = match encoder {
+        Av1anEncoder::SvtAv1 => ("svt-av1", "--fgs-table"),
+        Av1anEncoder::Aom => ("aom", "--film-grain-table="),
+        Av1anEncoder::Rav1e => ("rav1e", "--photon-noise-table"),
+    };
+
+    for (idx, e) in merged.iter().enumerate() {
+        let chunk_file = abs_dir.join(format!("zone_{:05}.tbl", idx));
+        let mut out = File::create(&chunk_file)?;
         writeln!(out, "filmgrn1")?;
         let duration_frames = e.end_frame.saturating_sub(e.start_frame).max(1);
-        let end_ts = match time_unit {
-            TimeUnitMode::Ns100 => frame_to_100ns(duration_frames, fps_num, fps_den),
-            TimeUnitMode::Frames => duration_frames as u64,
-            TimeUnitMode::Global => u64::MAX,
-        };
-        write_single_entry(&mut out, 0, end_ts, e)?;
+        let _end_100ns = frame_to_100ns(duration_frames, fps_num, fps_den);
+        // Write u64::MAX end timestamp per t=0 zone table so chunks never drop grain early
+        write_single_entry(&mut out, 0, u64::MAX, e)?;
+
+        if let Some(ref mut zf) = zones_file {
+            if encoder == Av1anEncoder::Aom {
+                writeln!(
+                    zf,
+                    "{} {} {} {}{}",
+                    e.start_frame,
+                    e.end_frame,
+                    enc_name,
+                    flag_fmt,
+                    chunk_file.display()
+                )?;
+            } else {
+                writeln!(
+                    zf,
+                    "{} {} {} {} {}",
+                    e.start_frame,
+                    e.end_frame,
+                    enc_name,
+                    flag_fmt,
+                    chunk_file.display()
+                )?;
+            }
+        }
     }
-    Ok(())
+
+    Ok(merged.len())
 }
 
 fn write_single_entry(
@@ -142,7 +292,6 @@ fn write_single_entry(
     Ok(())
 }
 
-/// Writes per-scene FILM_GRAIN_EVENT JSONL stream matching SVT-AV1 4.3.0+ AomFilmGrain fields.
 pub fn write_fgs_events_jsonl(
     path: &Path,
     entries: &[FgsTableEntry],
@@ -188,8 +337,6 @@ pub fn write_fgs_events_jsonl(
     Ok(())
 }
 
-/// Emits a self-contained C header & driver example for SVT-AV1 4.3.0+ FILM_GRAIN_EVENT integration.
-/// Compiling against the user's installed EbSvtAv1Enc.h guarantees exact sizeof(AomFilmGrain) ABI safety.
 pub fn write_svt_c_bridge(
     dir: &Path,
     entries: &[FgsTableEntry],
@@ -199,7 +346,7 @@ pub fn write_svt_c_bridge(
     let header_path = dir.join("ct_svt_fgs_bridge.h");
     let mut h = File::create(&header_path)?;
 
-    writeln!(h, "/* Auto-generated by CT-AV1-FGS-ENGINE v2.0.0 (Apache-2.0) */")?;
+    writeln!(h, "/* Auto-generated by CT-AV1-FGS-ENGINE v2.3.0 (Apache-2.0) */")?;
     writeln!(h, "/* Provides static AomFilmGrain models for SVT-AV1 4.3.0+ FILM_GRAIN_EVENT API */")?;
     writeln!(h, "#ifndef CT_SVT_FGS_BRIDGE_H")?;
     writeln!(h, "#define CT_SVT_FGS_BRIDGE_H")?;
@@ -271,8 +418,6 @@ pub fn write_svt_c_bridge(
     writeln!(h)?;
     writeln!(h, "static const size_t CT_FGS_EVENT_COUNT = {};", entries.len())?;
     writeln!(h)?;
-    writeln!(h, "/* Attach the matching FILM_GRAIN_EVENT to a picture before svt_av1_enc_send_picture().")?;
-    writeln!(h, " * IMPORTANT: Keep `node` and `CT_FGS_EVENTS` valid until svt_av1_enc_deinit() finishes. */")?;
     writeln!(h, "static inline void ct_attach_film_grain_event(")?;
     writeln!(h, "    EbBufferHeaderType *pic_hdr,")?;
     writeln!(h, "    EbPrivDataNode *node,")?;
@@ -311,7 +456,7 @@ pub fn write_vs_telemetry_json(
 
     writeln!(f, "{{")?;
     writeln!(f, "  \"engine\": \"CT-AV1-FGS-ENGINE\",")?;
-    writeln!(f, "  \"version\": \"2.0.0\",")?;
+    writeln!(f, "  \"version\": \"2.3.0\",")?;
     writeln!(f, "  \"grain_retain_pct\": {:.2},", grain_retain)?;
     writeln!(f, "  \"fgs_balance\": \"{}\",", balance_str)?;
     writeln!(f, "  \"scenes\": [")?;
@@ -335,8 +480,6 @@ pub fn write_vs_telemetry_json(
     Ok(())
 }
 
-/// Emits the fixed ct_fgs_vs.py module with valid docstring quotes and pure-core fallback
-/// when mvtools/rgvs are unavailable.
 pub fn write_vs_plugin_module(path: &Path) -> std::io::Result<()> {
     let plugin_code = r####"# -*- coding: utf-8 -*-
 """
@@ -362,12 +505,9 @@ def _load_telemetry(profile_path):
 
 
 def _pure_core_auto_degrain(clip16, retain_weight, protect_lines):
-    """Zero-external-plugin fallback using only VapourSynth built-in core.std."""
-    # Spatial impulse/mosquito cleanup via 3x3 median envelope clamp
     med = core.std.Median(clip16)
     clean_spatial = core.std.Expr([clip16, med], expr="x y - abs 1800 > y x ?")
 
-    # Temporal smoothing using 3-frame weighted average within scene
     temp_light = core.std.AverageFrames(clean_spatial, weights=[1, 4, 1], scenechange=True)
     temp_strong = core.std.AverageFrames(clean_spatial, weights=[1, 2, 4, 2, 1], scenechange=True)
 
